@@ -7,8 +7,10 @@ __pycache__/
 *.so
 .Python
 venv/
+.venv/
 env/
 ENV/
+ffmpeg_bin/
 *.prompt
 # Build outputs
 dist/
