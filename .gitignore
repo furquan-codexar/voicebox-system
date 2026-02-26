@@ -59,3 +59,5 @@ tauri/src-tauri/binaries/*
 tmp/
 temp/
 *.tmp
+
+youtube_clone_output/
