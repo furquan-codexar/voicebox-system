@@ -19,6 +19,11 @@ librosa>=0.10.0
 soundfile>=0.12.0
 numpy>=1.24.0
 
+# Gradio (optional, for voice clone UI)
+gradio>=4.0.0
+
 # Utilities
 python-multipart>=0.0.6
 Pillow>=10.0.0
+yt-dlp>=2024.1.0
+openpyxl>=3.1.0

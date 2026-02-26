@@ -1,151 +1,57 @@
-<p align="center">
-  <img src=".github/assets/icon-dark.webp" alt="Voicebox" width="120" height="120" />
-</p>
+# Voicebox (Backend)
 
-<h1 align="center">Voicebox</h1>
+The open-source voice synthesis backend. Clone voices, generate speech, and build voice-powered apps — all running locally on your machine.
 
-<p align="center">
-  <strong>The open-source voice synthesis studio.</strong><br/>
-  Clone voices. Generate speech. Build voice-powered apps.<br/>
-  All running locally on your machine.
-</p>
+## Quick Start (serve.sh)
 
-<p align="center">
-  <a href="https://github.com/jamiepine/voicebox/releases">
-    <img src="https://img.shields.io/github/downloads/jamiepine/voicebox/total?style=flat&color=blue" alt="Downloads" />
-  </a>
-  <a href="https://github.com/jamiepine/voicebox/releases/latest">
-    <img src="https://img.shields.io/github/v/release/jamiepine/voicebox?style=flat" alt="Release" />
-  </a>
-  <a href="https://github.com/jamiepine/voicebox/stargazers">
-    <img src="https://img.shields.io/github/stars/jamiepine/voicebox?style=flat" alt="Stars" />
-  </a>
-  <a href="https://github.com/jamiepine/voicebox/blob/main/LICENSE">
-    <img src="https://img.shields.io/github/license/jamiepine/voicebox?style=flat" alt="License" />
-  </a>
-</p>
+One script to set up and run the voice system on any machine:
 
-<p align="center">
-  <a href="https://voicebox.sh">voicebox.sh</a> •
-  <a href="#download">Download</a> •
-  <a href="#features">Features</a> •
-  <a href="#api">API</a> •
-  <a href="#roadmap">Roadmap</a>
-</p>
+```bash
+# First-time setup (venv, deps, FFmpeg, SoX)
+./serve.sh setup
 
-<br/>
+# Setup with PyTorch CUDA (Linux NVIDIA GPU)
+./serve.sh setup --cuda
 
-<p align="center">
-  <a href="https://voicebox.sh">
-    <img src="landing/public/assets/app-screenshot-1.webp" alt="Voicebox App Screenshot" width="800" />
-  </a>
-</p>
+# Start the API server
+./serve.sh
 
-<p align="center">
-  <em>Click the image above to watch the demo video on <a href="https://voicebox.sh">voicebox.sh</a></em>
-</p>
+# Run YouTube voice clone (CLI)
+./serve.sh youtube-clone --excel path/to/videos.xlsx -o output_folder
 
-<br/>
+# Run Gradio voice clone UI (web interface at http://localhost:7860)
+./serve.sh gradio
+```
 
-<p align="center">
-  <img src="landing/public/assets/app-screenshot-2.webp" alt="Voicebox Screenshot 2" width="800" />
-</p>
+**Requirements:** Python 3.10+, curl, unzip. Supports macOS (Intel/Apple Silicon) and Ubuntu/Debian Linux.
 
-<p align="center">
-  <img src="landing/public/assets/app-screenshot-3.webp" alt="Voicebox Screenshot 3" width="800" />
-</p>
-
-<br/>
+---
 
 ## What is Voicebox?
 
-Voicebox is a **local-first voice cloning studio** with DAW-like features for professional voice synthesis. Think of it as a **local, free and open-source alternative to ElevenLabs** — download models, clone voices, and generate speech entirely on your machine.
-
-Unlike cloud services that lock your voice data behind subscriptions, Voicebox gives you:
+Voicebox is a **local-first voice cloning backend** powered by Qwen3-TTS. Clone any voice from a few seconds of audio and generate speech via REST API or CLI scripts.
 
 - **Complete privacy** — models and voice data stay on your machine
-- **Professional tools** — multi-track timeline editor, audio trimming, conversation mixing
-- **Model flexibility** — currently powered by Qwen3-TTS, with support for XTTS, Bark, and other models coming soon
-- **API-first** — use the desktop app or integrate voice synthesis into your own projects
-- **Native performance** — built with Tauri (Rust), not Electron
+- **API-first** — integrate voice synthesis into your own projects
 - **Super fast on Mac** — MLX backend with native Metal acceleration for 4-5x faster inference on Apple Silicon
 
-Download a voice model, clone any voice from a few seconds of audio, and compose multi-voice projects with studio-grade editing tools. No Python install required, no cloud dependency, no limits.
-
 ---
 
-## Download
+## Running backend/scripts
 
-Voicebox is available now for macOS and Windows.
+| Script | How to run |
+|--------|------------|
+| API server | `./serve.sh` or `./serve.sh serve` |
+| YouTube voice clone (CLI) | `./serve.sh youtube-clone --excel path/to.xlsx -o out` or `python run_youtube_voice_clone.py --excel ... -o out` |
+| Gradio voice clone UI | `./serve.sh gradio` or `python run_voice_clone_gradio.py` |
 
-| Platform | Download |
-|----------|----------|
-| macOS (Apple Silicon) | [voicebox_aarch64.app.tar.gz](https://github.com/jamiepine/voicebox/releases/download/v0.1.0/voicebox_aarch64.app.tar.gz) |
-| macOS (Intel) | [voicebox_x64.app.tar.gz](https://github.com/jamiepine/voicebox/releases/download/v0.1.0/voicebox_x64.app.tar.gz) |
-| Windows (MSI) | [voicebox_0.1.0_x64_en-US.msi](https://github.com/jamiepine/voicebox/releases/download/v0.1.0/voicebox_0.1.0_x64_en-US.msi) |
-| Windows (Setup) | [voicebox_0.1.0_x64-setup.exe](https://github.com/jamiepine/voicebox/releases/download/v0.1.0/voicebox_0.1.0_x64-setup.exe) |
-
-> **Linux builds coming soon** — Currently blocked by GitHub runner disk space limitations.
-
----
-
-## Features
-
-### Voice Cloning with Qwen3-TTS
-
-Powered by Alibaba's **Qwen3-TTS** — a breakthrough model that achieves near-perfect voice cloning from just a few seconds of audio.
-
-- **Instant cloning** — Upload a sample, get a voice profile
-- **High fidelity** — Natural prosody, emotion, and cadence
-- **Multi-language** — English, Chinese, and more coming
-- **Lightning fast on Mac** — MLX backend leverages Apple Silicon's Neural Engine for super fast generation
-
-### Voice Profile Management
-
-- **Create profiles** from audio files or record directly in-app
-- **Import/Export** profiles to share or backup
-- **Multi-sample support** — combine multiple samples for higher quality cloning
-- **Organize** with descriptions and language tags
-
-### Speech Generation
-
-- **Text-to-speech** with any cloned voice
-- **Batch generation** for long-form content
-- **Smart caching** — regenerate instantly with voice prompt caching
-
-### Stories Editor
-
-Create multi-voice narratives, podcasts, and conversations with a timeline-based editor.
-
-- **Multi-track composition** — arrange multiple voice tracks in a single project
-- **Inline audio editing** — trim and split clips directly in the timeline
-- **Auto-playback** — preview stories with synchronized playhead
-- **Voice mixing** — build conversations with multiple participants
-
-### Recording & Transcription
-
-- **In-app recording** with waveform visualization
-- **System audio capture** — record desktop audio on macOS and Windows
-- **Automatic transcription** powered by Whisper
-- **Export recordings** in multiple formats
-
-### Generation History
-
-- **Full history** of all generated audio
-- **Search & filter** by voice, text, or date
-- **Re-generate** any past generation with one click
-
-### Flexible Deployment
-
-- **Local mode** — Everything runs on your machine
-- **Remote mode** — Connect to a GPU server on your network
-- **One-click server** — Turn any machine into a Voicebox server
+See [backend/scripts/README-YOUTUBE-CLONE.md](backend/scripts/README-YOUTUBE-CLONE.md) for detailed YouTube voice clone usage.
 
 ---
 
 ## API
 
-Voicebox exposes a full REST API, so you can integrate voice synthesis into your own apps.
+Voicebox exposes a full REST API at `http://localhost:8000` when running:
 
 ```bash
 # Generate speech
@@ -162,15 +68,7 @@ curl -X POST http://localhost:8000/profiles \
   -d '{"name": "My Voice", "language": "en"}'
 ```
 
-**Use cases:**
-
-- Game dialogue systems
-- Podcast/video production pipelines
-- Accessibility tools
-- Voice assistants
-- Content creation automation
-
-Full API documentation available at `http://localhost:8000/docs` when running.
+Full API documentation: `http://localhost:8000/docs` when the server is running.
 
 ---
 
@@ -178,129 +76,50 @@ Full API documentation available at `http://localhost:8000/docs` when running.
 
 | Layer | Technology |
 |-------|------------|
-| Desktop App | Tauri (Rust) |
-| Frontend | React, TypeScript, Tailwind CSS |
-| State | Zustand, React Query |
 | Backend | FastAPI (Python) |
 | Voice Model | Qwen3-TTS (PyTorch or MLX) |
 | Transcription | Whisper (PyTorch or MLX) |
 | Inference Engine | MLX (Apple Silicon) / PyTorch (Windows/Linux/Intel) |
 | Database | SQLite |
-| Audio | WaveSurfer.js, librosa |
-
-**Why this stack?**
-
-- **Tauri over Electron** — 10x smaller bundle, native performance, lower memory
-- **FastAPI** — Async Python with automatic OpenAPI schema generation
-- **Type-safe end-to-end** — Generated TypeScript client from OpenAPI spec
 
 ---
 
-## Roadmap
+## Project Structure
 
-Voicebox is the beginning of something bigger. Here's what's coming:
-
-### Coming Soon
-
-| Feature | Description |
-|---------|-------------|
-| **Real-time Synthesis** | Stream audio as it generates, word by word |
-| **Conversation Mode** | Multi-speaker dialogues with automatic turn-taking |
-| **Voice Effects** | Pitch shift, reverb, M3GAN-style effects |
-| **Timeline Editor** | Audio studio with word-level precision editing |
-| **More Models** | XTTS, Bark, and other open-source voice models |
-
-### Future Vision
-
-- **Voice Design** — Create new voices from text descriptions
-- **Project System** — Save and load complex multi-voice sessions
-- **Plugin Architecture** — Extend with custom models and effects
-- **Mobile Companion** — Control Voicebox from your phone
-
-Voicebox aims to be the **one-stop shop for everything voice** — cloning, synthesis, editing, effects, and beyond.
+```
+voicebox/
+├── backend/                 # Python FastAPI server + scripts
+│   ├── scripts/             # youtube_voice_clone.py, voice_clone_gradio.py
+│   ├── main.py
+│   ├── requirements.txt
+│   └── ...
+├── run_voice_clone_gradio.py
+├── run_youtube_voice_clone.py
+├── run_youtube_voice_clone.sh
+└── serve.sh
+```
 
 ---
 
 ## Development
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed setup and contribution guidelines.
-
-**Using the Makefile (recommended):** Run `make help` to see all available commands for setup, development, building, and testing.
-
-### Quick Start
-
-**With Makefile (Unix/macOS/Linux):**
+**Prerequisites:** [Python 3.10+](https://python.org)
 
 ```bash
-# Clone the repo
-git clone https://github.com/jamiepine/voicebox.git
-cd voicebox
+# Setup
+./serve.sh setup
 
-# Setup everything
-make setup
-
-# Start development
-make dev
+# Run API server (development with uvicorn reload, if using npm/bun)
+# Or use: ./serve.sh serve
+uvicorn backend.main:app --reload --port 17493
 ```
 
-**Manual setup (all platforms):**
-
-```bash
-# Clone the repo
-git clone https://github.com/jamiepine/voicebox.git
-cd voicebox
-
-# Install dependencies
-bun install
-
-# Install Python dependencies
-cd backend && pip install -r requirements.txt && cd ..
-
-# Start development
-bun run dev
-```
-
-**Prerequisites:** [Bun](https://bun.sh), [Rust](https://rustup.rs), [Python 3.11+](https://python.org). [XCode on macOS](https://developer.apple.com/xcode/).
-
-**Performance:** 
-- **Apple Silicon (M1/M2/M3)**: Uses MLX backend with native Metal acceleration for 4-5x faster inference
-- **Windows/Linux/Intel Mac**: Uses PyTorch backend (CUDA GPU recommended, CPU supported but slower)
-
-### Project Structure
-
-```
-voicebox/
-├── app/              # Shared React frontend
-├── tauri/            # Desktop app (Tauri + Rust)
-├── web/              # Web deployment
-├── backend/          # Python FastAPI server
-├── landing/          # Marketing website
-└── scripts/          # Build & release scripts
-```
-
----
-
-## Contributing
-
-Contributions welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-1. Fork the repo
-2. Create a feature branch
-3. Make your changes
-4. Submit a PR
-
-## Security
-
-Found a security vulnerability? Please report it responsibly. See [SECURITY.md](SECURITY.md) for details.
+**Performance:**
+- **Apple Silicon (M1/M2/M3)**: MLX backend with Metal acceleration
+- **Windows/Linux/Intel Mac**: PyTorch backend (CUDA GPU recommended)
 
 ---
 
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
-
----
-
-<p align="center">
-  <a href="https://voicebox.sh">voicebox.sh</a>
-</p>

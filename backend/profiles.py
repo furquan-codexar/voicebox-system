@@ -7,6 +7,8 @@ from datetime import datetime
 import uuid
 import shutil
 from pathlib import Path
+
+import numpy as np
 from sqlalchemy.orm import Session
 from sqlalchemy import select
 
@@ -20,7 +22,7 @@ from .database import (
     VoiceProfile as DBVoiceProfile,
     ProfileSample as DBProfileSample,
 )
-from .utils.audio import validate_reference_audio, load_audio, save_audio
+from .utils.audio import validate_reference_audio, load_audio, save_audio, normalize_audio
 from .utils.images import validate_image, process_avatar
 from .utils.cache import _get_cache_dir, clear_profile_cache
 from .tts import get_tts_model
@@ -90,7 +92,13 @@ async def add_profile_sample(
     if not profile:
         raise ValueError(f"Profile {profile_id} not found")
     
-    # Validate audio
+    # Load audio and auto-normalize if clipping to avoid "Audio is clipping" rejection
+    audio, sr = load_audio(audio_path)
+    if np.abs(audio).max() > 0.99:
+        audio = normalize_audio(audio)
+        save_audio(audio, audio_path, sr, trailing_silence_seconds=0)  # overwrite temp file so validation sees normalized audio
+    
+    # Validate audio (duration, level, and no clipping)
     is_valid, error_msg = validate_reference_audio(audio_path)
     if not is_valid:
         raise ValueError(f"Invalid reference audio: {error_msg}")
@@ -100,10 +108,10 @@ async def add_profile_sample(
     profile_dir = _get_profiles_dir() / profile_id
     profile_dir.mkdir(parents=True, exist_ok=True)
     
-    # Copy audio file to profile directory
+    # Copy audio file to profile directory (use normalized audio if we just normalized)
     dest_path = profile_dir / f"{sample_id}.wav"
     audio, sr = load_audio(audio_path)
-    save_audio(audio, str(dest_path), sr)
+    save_audio(audio, str(dest_path), sr, trailing_silence_seconds=0)
     
     # Create database entry
     db_sample = DBProfileSample(
@@ -379,7 +387,7 @@ async def create_voice_prompt_for_profile(
         combined_path = cache_dir / f"combined_{profile_id}_{combination_hash}.wav"
         
         # Save combined audio
-        save_audio(combined_audio, str(combined_path), 24000)
+        save_audio(combined_audio, str(combined_path), 24000, trailing_silence_seconds=0)
 
         # Create prompt from combined audio
         voice_prompt, _ = await tts_model.create_voice_prompt(
