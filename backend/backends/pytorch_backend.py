@@ -4,6 +4,7 @@ PyTorch backend implementation for TTS and STT.
 
 from typing import Optional, List, Tuple
 import asyncio
+import logging
 import torch
 import numpy as np
 from pathlib import Path
@@ -14,6 +15,8 @@ from ..utils.audio import normalize_audio, load_audio
 from ..utils.progress import get_progress_manager
 from ..utils.hf_progress import HFProgressTracker, create_hf_progress_callback
 from ..utils.tasks import get_task_manager
+
+logger = logging.getLogger(__name__)
 
 
 class PyTorchTTSBackend:
@@ -414,26 +417,29 @@ class PyTorchSTTBackend:
         Args:
             model_size: Model size (tiny, base, small, medium, large)
         """
-        print(f"[DEBUG] load_model_async called with size: {model_size}")
+        logger.debug("load_model_async called with size: %s", model_size)
         if model_size is None:
             model_size = self.model_size
 
-        print(f"[DEBUG] Model already loaded? {self.model is not None}, current size: {self.model_size}, requested: {model_size}")
+        logger.debug(
+            "Model already loaded? %s, current size: %s, requested: %s",
+            self.model is not None, self.model_size, model_size,
+        )
         if self.model is not None and self.model_size == model_size:
-            print(f"[DEBUG] Early return - model already loaded")
+            logger.debug("Early return - model already loaded")
             return
 
-        print(f"[DEBUG] Calling asyncio.to_thread for _load_model_sync")
+        logger.debug("Calling asyncio.to_thread for _load_model_sync")
         # Run blocking load in thread pool
         await asyncio.to_thread(self._load_model_sync, model_size)
-        print(f"[DEBUG] asyncio.to_thread completed")
+        logger.debug("asyncio.to_thread completed")
     
     # Alias for compatibility
     load_model = load_model_async
     
     def _load_model_sync(self, model_size: str):
         """Synchronous model loading."""
-        print(f"[DEBUG] _load_model_sync called for Whisper {model_size}")
+        logger.debug("_load_model_sync called for Whisper %s", model_size)
         try:
             progress_manager = get_progress_manager()
             task_manager = get_task_manager()
@@ -449,16 +455,16 @@ class PyTorchSTTBackend:
             tracker = HFProgressTracker(progress_callback, filter_non_downloads=is_cached)
 
             # Patch tqdm BEFORE importing transformers
-            print("[DEBUG] Starting tqdm patch BEFORE transformers import")
+            logger.debug("Starting tqdm patch BEFORE transformers import")
             tracker_context = tracker.patch_download()
             tracker_context.__enter__()
-            print("[DEBUG] tqdm patched, now importing transformers")
+            logger.debug("tqdm patched, now importing transformers")
 
             # Import transformers
             from transformers import WhisperProcessor, WhisperForConditionalGeneration
 
             model_name = f"openai/whisper-{model_size}"
-            print(f"[DEBUG] Model name: {model_name}")
+            logger.debug("Model name: %s", model_name)
 
             print(f"Loading Whisper model {model_size} on {self.device}...")
 

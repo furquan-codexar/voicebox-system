@@ -34,18 +34,114 @@ if __name__ == "__main__" and __package__ is None:
 
 import openpyxl
 
+try:
+    import colorama
+    colorama.init(autoreset=True)
+    _C = colorama.Fore
+    _S = colorama.Style
+except ImportError:
+    class _DummyColors:
+        __getattr__ = lambda self, _: ""
+    _C = _DummyColors()
+    _S = _DummyColors()
+
+
+def _log_section(msg: str) -> None:
+    """Section header (e.g. '=== Processing row 2 ===')."""
+    print(f"{_S.BRIGHT}{_C.CYAN}{msg}{_S.RESET_ALL}")
+
+
+def _log_ok(msg: str) -> None:
+    """Success / completion message."""
+    print(f"{_C.GREEN}{msg}{_S.RESET_ALL}")
+
+
+def _log_detail(label: str, value: str | int | float) -> None:
+    """Label: value (for URLs, paths, numbers)."""
+    print(f"  {_C.CYAN}{label}:{_S.RESET_ALL} {_C.WHITE}{value}{_S.RESET_ALL}")
+
+
+def _log_transcript(text: str) -> None:
+    """Whisper transcription output (highlighted)."""
+    print(f"  {_C.MAGENTA}[Whisper transcript]{_S.RESET_ALL} {_C.YELLOW}{text!r}{_S.RESET_ALL}")
+
+
+def _log_question(idx: int, text: str, out_path: str) -> None:
+    """Question index, text, and output file."""
+    print(f"    {_C.BLUE}Q{idx}{_S.RESET_ALL} {_C.WHITE}{text!r}{_S.RESET_ALL} -> {_C.CYAN}{out_path}{_S.RESET_ALL}")
+
+
+def _log_warn(msg: str) -> None:
+    """Warning message."""
+    print(f"{_C.YELLOW}{msg}{_S.RESET_ALL}")
+
+
+def _log_error(msg: str) -> None:
+    """Error message."""
+    print(f"{_C.RED}{msg}{_S.RESET_ALL}")
+
 # Default questions (used when --questions-file is not provided)
 DEFAULT_QUESTIONS = [
-    "What is your name?",
-    "Where are you from?",
-    "What do you do for a living?",
+    "Where is the red atrium?",
+    "Show me the superior venacava",
+    "Where is the blackflow?",
+    "What is the black flow?",
+    "What does the blad flow do?",
+    "How does the blood flow through the flood flow?",
+    "Tell me about the blood floor",
+    "Show me the blodd",
+    "Point to the blod",
+    "Explain the blud",
+    "Where is the bloed?",
+    "What is the a orta?",
+    "What does the ayorta do?",
+    "How does the blood flow through the eorta?",
+    "Tell me about the aorta",
+    "Show me the ay orta",
+    "Point to the a orter",
+    "Explain the aortic valve",
+    "Where is the a ortic valve?",
+    "What is the ayortic valve?",
+    "What does the aortic valv do?",
+    "How does the blood flow through the a ortic valv?",
+    "Tell me about the aortic value",
+    "Show me the ortic valve",
+    "Point to the atrioventricular av node",
+    "Explain the atrial ventricular node",
+    "Where is the atrio ventricular node?",
+    "What is the av node?"
 ]
 
-# Default TTS model size (CLI override available for STT)
+# Default TTS model size (overridden by --tts-model)
 TTS_MODEL_SIZE = "1.7B"
 
 # Voice clone reference audio must be 2–30 seconds (matches backend.utils.audio.validate_reference_audio)
 REFERENCE_MAX_DURATION = 30.0
+
+# Approximate VRAM (MiB) needed to load TTS so we can decide whether to keep Whisper in memory
+TTS_NEEDED_MB = {"1.7B": 6000, "0.6B": 4000}
+
+
+def _get_cuda_free_mb() -> int | None:
+    """Return current free GPU memory in MiB, or None if CUDA unavailable or query failed."""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        try:
+            out = subprocess.run(
+                ["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if out.returncode == 0 and out.stdout.strip():
+                return int(out.stdout.strip().split()[0])
+        except (FileNotFoundError, ValueError, subprocess.TimeoutExpired):
+            pass
+        return (
+            torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+        ) // (1024 * 1024)
+    except Exception:
+        return None
 
 
 def _parse_time_to_seconds(value) -> float | None:
@@ -141,6 +237,9 @@ def _download_youtube_audio(
     Returns path to downloaded WAV file, or None on failure.
     """
     template = str(temp_dir / f"row_{row_index}_raw.%(ext)s")
+    _log_detail("Downloading (yt-dlp)", f"row {row_index}")
+    _log_detail("  URL", url)
+    _log_detail("  output template", template)
     cmd = _yt_dlp_cmd() + [
         "-x",
         "--audio-format", "wav",
@@ -157,16 +256,17 @@ def _download_youtube_audio(
         )
         if result.returncode != 0:
             err = (result.stderr or result.stdout or "").strip()
-            logging.error("yt-dlp failed for %s: %s", url[:50], err or result.returncode)
+            _log_error(f"yt-dlp failed for row {row_index}: {err or result.returncode}")
             return None
     except (FileNotFoundError, subprocess.TimeoutExpired) as e:
-        logging.error("yt-dlp failed for %s: %s", url[:50], e)
+        _log_error(f"yt-dlp failed for row {row_index}: {e}")
         return None
     # yt-dlp may name the file with .wav or other; find any file matching our prefix
     candidates = list(temp_dir.glob(f"row_{row_index}_raw.*"))
     if not candidates:
-        logging.error("yt-dlp did not produce expected file for row %s", row_index)
+        _log_error(f"yt-dlp did not produce expected file for row {row_index}")
         return None
+    _log_ok(f"Downloaded audio -> {candidates[0]}")
     return candidates[0]
 
 
@@ -214,6 +314,12 @@ async def _process_video(
     """Download, trim, validate, transcribe, create voice prompt, generate for each question, save."""
     get_tts_model, get_whisper_model, load_audio, save_audio, validate_reference_audio, normalize_audio = _get_backend_imports()
 
+    _log_section(f"=== Processing row {row_index} ===")
+    _log_detail("YouTube URL", url)
+    _log_detail("Start (s)", start_s)
+    _log_detail("Duration (s)", duration_s)
+    _log_detail("Language", language or "auto")
+
     tts_model = get_tts_model()
     whisper_model = get_whisper_model()
 
@@ -221,66 +327,91 @@ async def _process_video(
     raw_path = _download_youtube_audio(url, temp_dir, row_index, ffmpeg_location)
     if raw_path is None:
         return
-    logging.info("Row %s: downloaded", row_index)
+    _log_detail("Raw audio file", str(raw_path))
 
     # Trim (cap duration at REFERENCE_MAX_DURATION so validation passes)
     effective_duration = min(duration_s, REFERENCE_MAX_DURATION)
     if duration_s > REFERENCE_MAX_DURATION:
-        logging.info(
-            "Row %s: duration %.0fs capped to %.0fs for voice reference (max %s seconds)",
-            row_index, duration_s, effective_duration, int(REFERENCE_MAX_DURATION),
+        _log_warn(
+            f"Duration {duration_s:.0f}s capped to {effective_duration:.0f}s for voice reference (max {int(REFERENCE_MAX_DURATION)}s)"
         )
     audio, sr = load_audio(str(raw_path), sample_rate=24000)
     start_sample = int(start_s * sr)
     end_sample = int((start_s + effective_duration) * sr)
     if start_sample >= len(audio):
-        logging.warning("Row %s: start time beyond audio length, skipping", row_index)
+        _log_error(f"Row {row_index}: start time beyond audio length (len={len(audio)/sr:.1f}s), skipping")
         return
     end_sample = min(end_sample, len(audio))
     trimmed = audio[start_sample:end_sample]
     segment_path = temp_dir / f"row_{row_index}_segment.wav"
     save_audio(trimmed, str(segment_path), sr)
+    _log_ok("Trimmed segment saved")
+    _log_detail("Segment path", str(segment_path))
+    _log_detail("Segment length (samples)", len(trimmed))
+    _log_detail("Segment duration (s)", f"{len(trimmed) / sr:.2f}")
+    _log_detail("Sample rate", sr)
 
     # Normalize if clipping (same as profiles)
     import numpy as np
     if np.abs(trimmed).max() > 0.99:
         trimmed = normalize_audio(trimmed)
         save_audio(trimmed, str(segment_path), sr)
+        _log_ok("Segment normalized (was clipping)")
 
     # Validate
     is_valid, err = validate_reference_audio(str(segment_path))
     if not is_valid:
-        logging.warning("Row %s: invalid reference audio: %s", row_index, err)
+        _log_error(f"Row {row_index}: invalid reference audio: {err}")
         return
-    logging.info("Row %s: validated segment", row_index)
+    _log_ok("Reference audio validated")
 
     # Transcribe
+    _log_detail("Transcribing with Whisper", f"model={stt_model_size}")
     await whisper_model.load_model_async(stt_model_size)
     transcript = await whisper_model.transcribe(str(segment_path), language=language or None)
     if not (transcript and transcript.strip()):
-        logging.warning("Row %s: empty transcript, skipping", row_index)
+        _log_error(f"Row {row_index}: empty transcript, skipping")
         return
-    logging.info("Row %s: transcribed", row_index)
+    _log_ok("Transcription done")
+    _log_transcript(transcript.strip())
+
+    # Unload Whisper only when GPU free memory is too low for TTS (avoids OOM; keeps Whisper loaded when VRAM allows)
+    tts_needed_mb = TTS_NEEDED_MB.get(TTS_MODEL_SIZE, 6000)
+    free_mb = _get_cuda_free_mb()
+    if free_mb is not None and free_mb < tts_needed_mb:
+        _log_detail("GPU free (MiB)", f"{free_mb} < {tts_needed_mb} -> unloading Whisper before TTS")
+        whisper_model.unload_model()
+        try:
+            import torch
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+    else:
+        _log_detail("GPU free (MiB)", f"{free_mb or 'N/A'} -> keeping Whisper loaded")
 
     # Voice prompt
+    _log_detail("Creating voice prompt", f"TTS model={TTS_MODEL_SIZE}")
     await tts_model.load_model_async(TTS_MODEL_SIZE)
     voice_prompt, _ = await tts_model.create_voice_prompt(
         str(segment_path),
         transcript.strip(),
         use_cache=False,
     )
-    logging.info("Row %s: voice prompt created", row_index)
+    _log_ok("Voice prompt created")
 
     # Generate for each question
+    _log_section(f"--- Generating {len(questions)} answer(s) for row {row_index} ---")
     for q_idx, text in enumerate(questions):
+        out_path = output_folder / f"video_{row_index:02d}_q{q_idx:02d}.wav"
+        _log_question(q_idx, text, str(out_path))
         audio_out, sample_rate = await tts_model.generate(
             text,
             voice_prompt,
             language=language,
         )
-        out_path = output_folder / f"video_{row_index:02d}_q{q_idx:02d}.wav"
         save_audio(audio_out, str(out_path), sample_rate)
-    logging.info("Row %s: generated %s files", row_index, len(questions))
+    _log_ok(f"Row {row_index}: generated {len(questions)} file(s)")
 
 
 async def async_main() -> None:
@@ -326,18 +457,60 @@ async def async_main() -> None:
         dest="ffmpeg_location",
         help="Path to ffmpeg executable or directory containing ffmpeg and ffprobe (if not on PATH)",
     )
+    parser.add_argument(
+        "--tts-model",
+        default="1.7B",
+        dest="tts_model",
+        choices=("0.6B", "1.7B"),
+        help="TTS model size: 0.6B (less VRAM) or 1.7B (default)",
+    )
     args = parser.parse_args()
+
+    # Apply TTS model size for this run
+    global TTS_MODEL_SIZE
+    TTS_MODEL_SIZE = args.tts_model
 
     logging.basicConfig(level=logging.INFO, format="%(message)s")
 
+    _log_section("========== YouTube Voice Clone ==========")
+    _log_detail("Excel file", str(args.excel))
+    _log_detail("Output folder", str(args.output_folder))
+    _log_detail("Language", args.language)
+    _log_detail("STT model (Whisper)", args.stt_model)
+    _log_detail("TTS model", TTS_MODEL_SIZE)
+
+    # Log GPU status when using CUDA (script uses GPU by default when available)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            free_mb = _get_cuda_free_mb()
+            needed = TTS_NEEDED_MB.get(TTS_MODEL_SIZE, 6000)
+            if free_mb is not None:
+                if free_mb < needed:
+                    _log_warn(
+                        f"GPU has ~{free_mb} MiB free; {TTS_MODEL_SIZE} needs ~{needed} MiB. "
+                        "You may get CUDA OOM. Free GPU memory or use --tts-model 0.6B / CPU (CUDA_VISIBLE_DEVICES=\"\")."
+                    )
+                else:
+                    _log_ok(f"Using GPU (CUDA); ~{free_mb} MiB free.")
+        else:
+            _log_detail("Device", "CUDA not available; using CPU (slower).")
+    except Exception:
+        pass
+
     if not args.excel.exists():
-        logging.error("Excel file not found: %s", args.excel)
+        _log_error(f"Excel file not found: {args.excel}")
         sys.exit(1)
 
     rows = _read_excel_rows(args.excel)
     if not rows:
-        logging.error("No valid video rows found in Excel")
+        _log_error("No valid video rows found in Excel")
         sys.exit(1)
+
+    _log_ok(f"Loaded {len(rows)} video row(s) from Excel")
+    for i, (u, start, dur) in enumerate(rows):
+        url_short = u[:70] + "..." if len(u) > 70 else u
+        _log_detail(f"  Row {i}", f"URL={url_short}  Start={start}s  Duration={dur}s")
 
     if args.questions_file is not None:
         if not args.questions_file.exists():
@@ -348,11 +521,15 @@ async def async_main() -> None:
             if line.strip()
         ]
         if not questions:
-            logging.error("No non-empty questions in %s", args.questions_file)
+            _log_error(f"No non-empty questions in {args.questions_file}")
             sys.exit(1)
-        logging.info("Loaded %s questions from %s", len(questions), args.questions_file)
+        _log_ok(f"Loaded {len(questions)} question(s) from {args.questions_file}")
     else:
         questions = DEFAULT_QUESTIONS
+        _log_detail("Questions (default)", f"{len(questions)} built-in")
+
+    for i, q in enumerate(questions):
+        _log_detail(f"  Q{i}", q[:80] + ("..." if len(q) > 80 else ""))
 
     args.output_folder.mkdir(parents=True, exist_ok=True)
 
@@ -375,6 +552,23 @@ async def async_main() -> None:
     else:
         ffmpeg_location = None
 
+    # Pre-load models once so the loop only does per-video work (download, trim, transcribe, voice prompt, generate)
+    _log_section("---------- Pre-loading models ----------")
+    get_tts_model, get_whisper_model, _, _, _, _ = _get_backend_imports()
+    _log_detail("Pre-loading Whisper", args.stt_model)
+    await get_whisper_model().load_model_async(args.stt_model)
+    _log_ok("Whisper ready")
+    tts_needed_mb = TTS_NEEDED_MB.get(TTS_MODEL_SIZE, 6000)
+    whisper_approx_mb = 2000  # base ~1.5–2 GiB
+    free_mb = _get_cuda_free_mb()
+    if free_mb is not None and free_mb >= whisper_approx_mb + tts_needed_mb:
+        _log_detail("Pre-loading TTS", TTS_MODEL_SIZE)
+        await get_tts_model().load_model_async(TTS_MODEL_SIZE)
+        _log_ok("TTS ready")
+    else:
+        _log_detail("TTS", "will load on first use (VRAM check)")
+
+    _log_section("---------- Processing videos ----------")
     with tempfile.TemporaryDirectory(prefix="youtube_voice_clone_") as temp_dir:
         temp_path = Path(temp_dir)
         for row_index, (url, start_s, duration_s) in enumerate(rows):
@@ -392,13 +586,20 @@ async def async_main() -> None:
                     ffmpeg_location,
                 )
             except Exception as e:
+                _log_error(f"Row {row_index} failed: {e}")
                 logging.exception("Row %s failed: %s", row_index, e)
 
-    logging.info("Done. Output folder: %s", args.output_folder.resolve())
+    _log_section("========== Done ==========")
+    _log_ok(f"Output folder: {args.output_folder.resolve()}")
 
 
 def main() -> None:
-    asyncio.run(async_main())
+    try:
+        asyncio.run(async_main())
+    except KeyboardInterrupt:
+        print()
+        _log_warn("Stopped by user (keyboard interrupt). Exiting without finishing remaining videos.")
+        sys.exit(130)
 
 
 if __name__ == "__main__":
