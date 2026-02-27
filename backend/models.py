@@ -299,3 +299,29 @@ class StoryItemTrim(BaseModel):
 class StoryItemSplit(BaseModel):
     """Request model for splitting a story item."""
     split_time_ms: int = Field(..., ge=0)  # Time within the clip to split at (relative to clip start)
+
+
+# ============================================
+# BATCH VOICE CLONE
+# ============================================
+
+
+class BatchCloneResponse(BaseModel):
+    """Response model for starting a batch voice clone."""
+    batch_id: str
+    status: str = "processing"
+
+
+class BatchCloneProgress(BaseModel):
+    """Progress info for batch clone."""
+    current_source: int
+    current_line: int
+    total_sources: int
+    total_lines: int
+
+
+class BatchCloneStatusResponse(BaseModel):
+    """Response model for batch clone status."""
+    status: str  # "processing" | "complete" | "error"
+    progress: Optional[BatchCloneProgress] = None
+    error: Optional[str] = None

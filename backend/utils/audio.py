@@ -68,6 +68,7 @@ def save_audio(
     audio: np.ndarray,
     path: str,
     sample_rate: int = 24000,
+    trailing_silence_seconds: float = 0,
 ) -> None:
     """
     Save audio file.
@@ -76,7 +77,12 @@ def save_audio(
         audio: Audio array
         path: Output path
         sample_rate: Sample rate
+        trailing_silence_seconds: If > 0, append this many seconds of silence at the end
     """
+    if trailing_silence_seconds > 0:
+        silence_samples = int(trailing_silence_seconds * sample_rate)
+        silence = np.zeros(silence_samples, dtype=audio.dtype)
+        audio = np.concatenate([audio, silence])
     sf.write(path, audio, sample_rate)
 
 

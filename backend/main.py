@@ -22,11 +22,29 @@ import uuid
 import asyncio
 import signal
 import os
+import sys
+import logging
 
-from . import database, models, profiles, history, tts, transcribe, config, export_import, channels, stories, __version__
+# Ensure logging is configured (when run via uvicorn directly, server.py may not run)
+if not logging.getLogger().handlers:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+        stream=sys.stderr,
+    )
+
+from . import database, models, profiles, history, tts, transcribe, config, export_import, channels, stories, voice_clone_batch, __version__
 from .database import get_db, Generation as DBGeneration, VoiceProfile as DBVoiceProfile
 from .utils.progress import get_progress_manager
 from .utils.tasks import get_task_manager
+from .utils.batch_store import (
+    start_batch,
+    update_batch_progress,
+    complete_batch,
+    error_batch,
+    get_batch_status,
+    get_batch_zip,
+)
 from .utils.cache import clear_voice_prompt_cache
 from .platform_detect import get_backend_type
 
@@ -795,10 +813,15 @@ async def export_generation_audio(
 # TRANSCRIPTION ENDPOINTS
 # ============================================
 
+VALID_STT_MODELS = ("tiny", "base", "small", "medium", "large")
+logger = logging.getLogger(__name__)
+
+
 @app.post("/transcribe", response_model=models.TranscriptionResponse)
 async def transcribe_audio(
     file: UploadFile = File(...),
     language: Optional[str] = Form(None),
+    stt_model: Optional[str] = Form(None),
 ):
     """Transcribe audio file to text."""
     # Save uploaded file to temporary location
@@ -816,8 +839,18 @@ async def transcribe_audio(
         # Transcribe
         whisper_model = transcribe.get_whisper_model()
 
-        # Check if Whisper model is downloaded (uses default size "base")
+        # Use requested stt_model or default from backend
         model_size = whisper_model.model_size
+        if stt_model is not None and str(stt_model).strip():
+            stt = str(stt_model).strip().lower()
+            if stt in VALID_STT_MODELS:
+                model_size = stt
+            else:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Invalid stt_model. Must be one of: {', '.join(VALID_STT_MODELS)}",
+                )
+
         model_name = f"openai/whisper-{model_size}"
 
         # Check if model is cached
@@ -846,6 +879,7 @@ async def transcribe_audio(
                 }
             )
 
+        await whisper_model.load_model_async(model_size)
         text = await whisper_model.transcribe(tmp_path, language)
         
         return models.TranscriptionResponse(
@@ -853,11 +887,217 @@ async def transcribe_audio(
             duration=duration,
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         # Clean up temp file
         Path(tmp_path).unlink(missing_ok=True)
+
+
+# ============================================
+# BATCH VOICE CLONE ENDPOINTS
+# ============================================
+
+
+def _parse_time_from_form(value) -> float | None:
+    """Parse start/end time from form (seconds or M:SS)."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    s = str(value).strip()
+    if not s:
+        return None
+    # M:SS or MM:SS
+    import re
+    m = re.match(r"^(\d+):(\d{2})$", s)
+    if m:
+        return int(m.group(1)) * 60 + int(m.group(2))
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+@app.post("/voice-clone/batch", response_model=models.BatchCloneResponse)
+async def start_batch_voice_clone(
+    mode: str = Form(...),
+    youtube_url: Optional[str] = Form(None),
+    start_seconds: Optional[str] = Form(None),
+    end_seconds: Optional[str] = Form(None),
+    text: Optional[str] = Form(None),
+    text_file: Optional[UploadFile] = File(None),
+    language: str = Form("en"),
+    stt_model: str = Form("base"),
+    audio_files: List[UploadFile] = File(default=[]),
+    ffmpeg_location: Optional[str] = Form(None),
+):
+    """Start a batch voice clone. Returns batch_id for status polling and ZIP download."""
+    batch_id = str(uuid.uuid4())
+    logger.info("[API] POST /voice-clone/batch: batch_id=%s, mode=%s", batch_id[:8], mode)
+
+    # Parse text lines
+    text_lines: list[str] = []
+    if text and text.strip():
+        text_lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
+    elif text_file and text_file.filename:
+        content = (await text_file.read()).decode("utf-8", errors="replace")
+        text_lines = [line.strip() for line in content.splitlines() if line.strip()]
+
+    if not text_lines:
+        raise HTTPException(status_code=400, detail="Provide text (one phrase per line) or upload a .txt file")
+
+    mode_lower = mode.strip().lower()
+    if mode_lower not in ("youtube", "upload"):
+        raise HTTPException(status_code=400, detail="mode must be 'youtube' or 'upload'")
+
+    if stt_model.strip().lower() not in VALID_STT_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"stt_model must be one of: {', '.join(VALID_STT_MODELS)}",
+        )
+
+    # Read upload files before spawning task (request body may close)
+    audio_file_data: list[tuple[str, bytes]] = []
+    if mode_lower == "upload" and audio_files:
+        for f in audio_files:
+            if not f.filename:
+                continue
+            ext = Path(f.filename).suffix.lower()
+            if ext not in voice_clone_batch.AUDIO_EXTENSIONS:
+                continue
+            content = await f.read()
+            audio_file_data.append((f"audio_{len(audio_file_data)}{ext}", content))
+
+    if mode_lower == "youtube":
+        if not youtube_url or not youtube_url.strip():
+            raise HTTPException(status_code=400, detail="youtube_url is required for YouTube mode")
+        start_s = _parse_time_from_form(start_seconds)
+        end_s = _parse_time_from_form(end_seconds)
+        if start_s is None or end_s is None:
+            raise HTTPException(
+                status_code=400,
+                detail="start_seconds and end_seconds are required (e.g. 0 and 30, or 1:30)",
+            )
+        if end_s <= start_s:
+            raise HTTPException(status_code=400, detail="end_seconds must be greater than start_seconds")
+        duration = end_s - start_s
+        if duration < 2 or duration > 30:
+            raise HTTPException(
+                status_code=400,
+                detail="Duration (end - start) must be 2–30 seconds for voice reference",
+            )
+    elif mode_lower == "upload" and not audio_file_data:
+        raise HTTPException(
+            status_code=400,
+            detail="At least one audio file is required for upload mode (.wav, .mp3, .flac, .ogg, .m4a)",
+        )
+
+    total_sources = 1 if mode_lower == "youtube" else max(1, len(audio_file_data))
+    logger.info("[API] Batch %s: %s sources, %s text lines, language=%s, stt_model=%s", batch_id[:8], total_sources, len(text_lines), language, stt_model)
+    start_batch(batch_id, total_sources, len(text_lines))
+
+    async def run_batch():
+        logger.info("[API] Batch %s: background task started, calling run_batch_voice_clone", batch_id[:8])
+        try:
+            ffmpeg_path = Path(ffmpeg_location).resolve() if ffmpeg_location and ffmpeg_location.strip() else None
+
+            def progress_cb(s_idx: int, l_idx: int, tot_s: int, tot_l: int):
+                update_batch_progress(batch_id, s_idx, l_idx, tot_s, tot_l)
+
+            if mode_lower == "youtube":
+                zip_bytes, filenames = await voice_clone_batch.run_batch_voice_clone(
+                    mode="youtube",
+                    youtube_url=youtube_url.strip(),
+                    start_seconds=start_s,
+                    end_seconds=end_s,
+                    text_lines=text_lines,
+                    language=language or "en",
+                    stt_model=stt_model.strip().lower(),
+                    ffmpeg_location=ffmpeg_path,
+                    progress_callback=progress_cb,
+                )
+            else:
+                if not audio_file_data:
+                    raise ValueError("At least one audio file is required for upload mode")
+
+                with tempfile.TemporaryDirectory(prefix="voice_clone_upload_") as tmpdir:
+                    tmp_path = Path(tmpdir)
+                    audio_paths = []
+                    for name, content in audio_file_data:
+                        path = tmp_path / name
+                        path.write_bytes(content)
+                        audio_paths.append(path)
+
+                    zip_bytes, filenames = await voice_clone_batch.run_batch_voice_clone(
+                        mode="upload",
+                        audio_paths=audio_paths,
+                        text_lines=text_lines,
+                        language=language or "en",
+                        stt_model=stt_model.strip().lower(),
+                        progress_callback=progress_cb,
+                    )
+
+            complete_batch(batch_id, zip_bytes, filenames)
+            logger.info("[API] Batch %s: background task completed successfully", batch_id[:8])
+        except Exception as e:
+            logger.exception("[API] Batch %s: background task failed: %s", batch_id[:8], e)
+            error_batch(batch_id, str(e))
+
+    asyncio.create_task(run_batch())
+    logger.info("[API] Batch %s: background task started, returning 200 to client", batch_id[:8])
+    return models.BatchCloneResponse(batch_id=batch_id, status="processing")
+
+
+@app.get("/voice-clone/batch/{batch_id}/status", response_model=models.BatchCloneStatusResponse)
+async def get_batch_clone_status(batch_id: str):
+    """Get batch clone status for polling."""
+    state = get_batch_status(batch_id)
+    if not state:
+        logger.info("[API] GET /voice-clone/batch/%s/status: 404 not found", batch_id[:8])
+        raise HTTPException(status_code=404, detail="Batch not found")
+
+    progress = None
+    if state.status == "processing" and (state.total_sources or state.total_lines):
+        progress = models.BatchCloneProgress(
+            current_source=state.current_source,
+            current_line=state.current_line,
+            total_sources=state.total_sources,
+            total_lines=state.total_lines,
+        )
+
+    logger.info("[API] GET /voice-clone/batch/%s/status: status=%s", batch_id[:8], state.status)
+    return models.BatchCloneStatusResponse(
+        status=state.status,
+        progress=progress,
+        error=state.error,
+    )
+
+
+@app.get("/voice-clone/batch/{batch_id}/zip")
+async def download_batch_clone_zip(batch_id: str):
+    """Download the ZIP file when batch is complete."""
+    zip_bytes = get_batch_zip(batch_id)
+    if zip_bytes is None:
+        state = get_batch_status(batch_id)
+        if not state:
+            logger.info("[API] GET /voice-clone/batch/%s/zip: 404 batch not found", batch_id[:8])
+            raise HTTPException(status_code=404, detail="Batch not found")
+        if state.status == "processing":
+            logger.info("[API] GET /voice-clone/batch/%s/zip: 202 still processing", batch_id[:8])
+            raise HTTPException(status_code=202, detail="Batch still processing")
+        if state.status == "error":
+            logger.info("[API] GET /voice-clone/batch/%s/zip: 400 batch failed", batch_id[:8])
+            raise HTTPException(status_code=400, detail=state.error or "Batch failed")
+
+    logger.info("[API] GET /voice-clone/batch/%s/zip: 200 serving ZIP (%.1f KB)", batch_id[:8], len(zip_bytes) / 1024)
+    return StreamingResponse(
+        io.BytesIO(zip_bytes),
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="voice-clone-batch.zip"'},
+    )
 
 
 # ============================================

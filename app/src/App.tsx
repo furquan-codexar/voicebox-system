@@ -66,7 +66,20 @@ function App() {
   // Setup window close handler and auto-start server when running in Tauri (production only)
   useEffect(() => {
     if (!platform.metadata.isTauri) {
-      setServerReady(true); // Web assumes server is running
+      // Web: set server URL from lifecycle (uses window.location.hostname to avoid Private Network Access blocking)
+      platform.lifecycle
+        .startServer(false)
+        .then((serverUrl) => {
+          useServerStore.getState().setServerUrl(serverUrl);
+          setServerReady(true);
+        })
+        .catch(() => {
+          // Fallback: assume server on same host, port 17493
+          useServerStore.getState().setServerUrl(
+            `http://${window.location.hostname}:17493`,
+          );
+          setServerReady(true);
+        });
       return;
     }
 
@@ -136,8 +149,8 @@ function App() {
     return () => clearInterval(interval);
   }, [serverReady, platform.metadata.isTauri]);
 
-  // Show loading screen while server is starting in Tauri
-  if (platform.metadata.isTauri && !serverReady) {
+  // Show loading screen until server URL is set (Tauri: starting server; Web: resolving URL from hostname)
+  if (!serverReady) {
     return (
       <div
         className={cn(

@@ -1,6 +1,7 @@
 import { createRootRoute, createRoute, createRouter, Outlet } from '@tanstack/react-router';
 import { AppFrame } from '@/components/AppFrame/AppFrame';
 import { AudioTab } from '@/components/AudioTab/AudioTab';
+import { BulkCloneTab } from '@/components/BulkCloneTab/BulkCloneTab';
 import { MainEditor } from '@/components/MainEditor/MainEditor';
 import { ModelsTab } from '@/components/ModelsTab/ModelsTab';
 import { ServerTab } from '@/components/ServerTab/ServerTab';
@@ -79,6 +80,13 @@ const indexRoute = createRoute({
   component: MainEditor,
 });
 
+// Bulk Clone route
+const bulkCloneRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/bulk-clone',
+  component: BulkCloneTab,
+});
+
 // Stories route
 const storiesRoute = createRoute({
   getParentRoute: () => rootRoute,
@@ -117,6 +125,7 @@ const serverRoute = createRoute({
 // Route tree
 const routeTree = rootRoute.addChildren([
   indexRoute,
+  bulkCloneRoute,
   storiesRoute,
   voicesRoute,
   audioRoute,

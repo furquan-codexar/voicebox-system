@@ -508,6 +508,36 @@ class ApiClient {
 
     return response.blob();
   }
+
+  // Batch Voice Clone
+  async startBatchClone(formData: FormData): Promise<{ batch_id: string; status: string }> {
+    const url = `${this.getBaseUrl()}/voice-clone/batch`;
+    const response = await fetch(url, {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({
+        detail: response.statusText,
+      }));
+      throw new Error(typeof error.detail === 'string' ? error.detail : error.detail?.message || 'Failed to start batch');
+    }
+
+    return response.json();
+  }
+
+  async getBatchCloneStatus(batchId: string): Promise<{
+    status: string;
+    progress?: { current_source: number; current_line: number; total_sources: number; total_lines: number };
+    error?: string;
+  }> {
+    return this.request(`/voice-clone/batch/${batchId}/status`);
+  }
+
+  getBatchCloneZipUrl(batchId: string): string {
+    return `${this.getBaseUrl()}/voice-clone/batch/${batchId}/zip`;
+  }
 }
 
 export const apiClient = new ApiClient();

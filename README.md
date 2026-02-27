@@ -229,6 +229,16 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed setup and contribution guide
 
 ### Quick Start
 
+**One-command start (Linux/macOS/WSL):**
+
+```bash
+git clone https://github.com/jamiepine/voicebox.git
+cd voicebox
+./start.sh
+```
+
+This installs prerequisites (Python, Bun) if needed, sets up dependencies, and runs backend + web app bound to your machine's IP. Access at `http://<your-ip>:5173`.
+
 **With Makefile (Unix/macOS/Linux):**
 
 ```bash
