@@ -14,6 +14,7 @@ from datetime import datetime
 import asyncio
 import uvicorn
 import argparse
+import json
 import torch
 import tempfile
 import io
@@ -921,6 +922,33 @@ def _parse_time_from_form(value) -> float | None:
         return None
 
 
+def _parse_json_corpus(content: str) -> list[tuple[str, str]]:
+    """Parse wav_corpus JSON to list of (wav_filename, text)."""
+    data = json.loads(content)
+    categories = data.get("categories")
+    if not isinstance(categories, dict):
+        raise ValueError("JSON must have a 'categories' object")
+    entries: list[tuple[str, str]] = []
+    for cat_data in categories.values():
+        if not isinstance(cat_data, dict):
+            continue
+        wavs = cat_data.get("wavs")
+        if not isinstance(wavs, list):
+            continue
+        for item in wavs:
+            if not isinstance(item, dict):
+                continue
+            wav = item.get("wav")
+            text_val = item.get("text")
+            if not wav or not isinstance(text_val, str) or not text_val.strip():
+                continue
+            wav_str = str(wav).strip()
+            if not wav_str.endswith(".wav"):
+                wav_str = f"{wav_str}.wav"
+            entries.append((wav_str, text_val.strip()))
+    return entries
+
+
 @app.post("/voice-clone/batch", response_model=models.BatchCloneResponse)
 async def start_batch_voice_clone(
     mode: str = Form(...),
@@ -929,6 +957,8 @@ async def start_batch_voice_clone(
     end_seconds: Optional[str] = Form(None),
     text: Optional[str] = Form(None),
     text_file: Optional[UploadFile] = File(None),
+    json_file: Optional[UploadFile] = File(None),
+    text_input_mode: Optional[str] = Form(None),
     language: str = Form("en"),
     stt_model: str = Form("base"),
     audio_files: List[UploadFile] = File(default=[]),
@@ -936,18 +966,52 @@ async def start_batch_voice_clone(
 ):
     """Start a batch voice clone. Returns batch_id for status polling and ZIP download."""
     batch_id = str(uuid.uuid4())
-    logger.info("[API] POST /voice-clone/batch: batch_id=%s, mode=%s", batch_id[:8], mode)
+    logger.info("[API] POST /voice-clone/batch: batch_id=%s, mode=%s, text_input_mode=%s", batch_id[:8], mode, text_input_mode)
 
-    # Parse text lines
-    text_lines: list[str] = []
-    if text and text.strip():
+    # Parse text: when text_input_mode is 'json', prefer json_file; otherwise text -> text_file -> json_file
+    text_lines: list[str] | None = None
+    text_entries: list[tuple[str, str]] | None = None
+
+    if (text_input_mode or "").strip().lower() == "json":
+        if json_file and json_file.filename:
+            content = (await json_file.read()).decode("utf-8", errors="replace")
+            try:
+                text_entries = _parse_json_corpus(content)
+            except json.JSONDecodeError as e:
+                raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e)) from e
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="JSON file was expected but not received. Please select a JSON file in the 'Upload JSON' tab and try again.",
+            )
+    elif text and text.strip():
         text_lines = [line.strip() for line in text.strip().splitlines() if line.strip()]
     elif text_file and text_file.filename:
         content = (await text_file.read()).decode("utf-8", errors="replace")
         text_lines = [line.strip() for line in content.splitlines() if line.strip()]
+    elif json_file and json_file.filename:
+        content = (await json_file.read()).decode("utf-8", errors="replace")
+        try:
+            text_entries = _parse_json_corpus(content)
+        except json.JSONDecodeError as e:
+            raise HTTPException(status_code=400, detail=f"Invalid JSON: {e}") from e
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e)) from e
 
-    if not text_lines:
-        raise HTTPException(status_code=400, detail="Provide text (one phrase per line) or upload a .txt file")
+    if text_entries is None and (not text_lines or len(text_lines) == 0):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide text (one phrase per line), upload a .txt file, or upload a .json corpus file",
+        )
+    if text_entries is not None and len(text_entries) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="JSON corpus has no valid entries (each wavs item needs 'wav' and 'text')",
+        )
+
+    num_lines = len(text_entries) if text_entries is not None else len(text_lines or [])
 
     mode_lower = mode.strip().lower()
     if mode_lower not in ("youtube", "upload"):
@@ -996,8 +1060,8 @@ async def start_batch_voice_clone(
         )
 
     total_sources = 1 if mode_lower == "youtube" else max(1, len(audio_file_data))
-    logger.info("[API] Batch %s: %s sources, %s text lines, language=%s, stt_model=%s", batch_id[:8], total_sources, len(text_lines), language, stt_model)
-    start_batch(batch_id, total_sources, len(text_lines))
+    logger.info("[API] Batch %s: %s sources, %s text entries, language=%s, stt_model=%s", batch_id[:8], total_sources, num_lines, language, stt_model)
+    start_batch(batch_id, total_sources, num_lines)
 
     async def run_batch():
         logger.info("[API] Batch %s: background task started, calling run_batch_voice_clone", batch_id[:8])
@@ -1007,17 +1071,24 @@ async def start_batch_voice_clone(
             def progress_cb(s_idx: int, l_idx: int, tot_s: int, tot_l: int):
                 update_batch_progress(batch_id, s_idx, l_idx, tot_s, tot_l)
 
+            batch_kwargs: dict = {
+                "language": language or "en",
+                "stt_model": stt_model.strip().lower(),
+                "progress_callback": progress_cb,
+            }
+            if text_entries is not None:
+                batch_kwargs["text_entries"] = text_entries
+            else:
+                batch_kwargs["text_lines"] = text_lines
+
             if mode_lower == "youtube":
                 zip_bytes, filenames = await voice_clone_batch.run_batch_voice_clone(
                     mode="youtube",
                     youtube_url=youtube_url.strip(),
                     start_seconds=start_s,
                     end_seconds=end_s,
-                    text_lines=text_lines,
-                    language=language or "en",
-                    stt_model=stt_model.strip().lower(),
                     ffmpeg_location=ffmpeg_path,
-                    progress_callback=progress_cb,
+                    **batch_kwargs,
                 )
             else:
                 if not audio_file_data:
@@ -1034,10 +1105,7 @@ async def start_batch_voice_clone(
                     zip_bytes, filenames = await voice_clone_batch.run_batch_voice_clone(
                         mode="upload",
                         audio_paths=audio_paths,
-                        text_lines=text_lines,
-                        language=language or "en",
-                        stt_model=stt_model.strip().lower(),
-                        progress_callback=progress_cb,
+                        **batch_kwargs,
                     )
 
             complete_batch(batch_id, zip_bytes, filenames)

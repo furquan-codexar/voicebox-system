@@ -112,15 +112,16 @@ async def _process_source_and_generate(
     source_index: int,
     output_prefix: str,
     output_folder: Path,
-    text_lines: list[str],
+    text_entries: list[tuple[str, str]],
     language: str,
     stt_model: str,
     progress_callback: Callable[[int, int, int, int], None] | None,
     total_sources: int,
 ) -> list[Path]:
     """
-    Validate, transcribe, create voice prompt, generate for each text line.
+    Validate, transcribe, create voice prompt, generate for each (out_name, text) entry.
     Returns list of output file paths. Adds 2s trailing silence to each output.
+    text_entries: list of (output_filename, tts_text).
     """
     is_valid, err = validate_reference_audio(str(segment_path))
     if not is_valid:
@@ -147,19 +148,23 @@ async def _process_source_and_generate(
         use_cache=False,
     )
 
-    logger.info("[Batch] Source %s: voice prompt created, generating %s output lines", source_index, len(text_lines))
+    total_entries = len(text_entries)
+    logger.info("[Batch] Source %s: voice prompt created, generating %s outputs", source_index, total_entries)
 
     output_paths = []
-    for line_idx, text in enumerate(text_lines):
+    for line_idx, (out_name, text) in enumerate(text_entries):
         if progress_callback:
-            progress_callback(source_index, line_idx + 1, total_sources, len(text_lines))
-        logger.info("[Batch] Source %s: generating line %s/%s: %s", source_index, line_idx + 1, len(text_lines), text[:50] + "..." if len(text) > 50 else text)
+            progress_callback(source_index, line_idx + 1, total_sources, total_entries)
+        logger.info("[Batch] Source %s: generating %s/%s: %s -> %s", source_index, line_idx + 1, total_entries, text[:50] + "..." if len(text) > 50 else text, out_name)
         audio_out, sample_rate = await tts_model.generate(
             text,
             voice_prompt,
             language=language,
         )
-        out_path = output_folder / f"{output_prefix}_{source_index:02d}_line_{line_idx:02d}.wav"
+        # For multiple sources, prefix with source index to avoid ZIP filename collisions
+        if total_sources > 1:
+            out_name = f"{source_index:02d}_{out_name}"
+        out_path = output_folder / out_name
         save_audio(
             audio_out,
             str(out_path),
@@ -179,7 +184,8 @@ async def run_batch_voice_clone(
     start_seconds: float | None = None,
     end_seconds: float | None = None,
     audio_paths: list[Path] | None = None,
-    text_lines: list[str],
+    text_lines: list[str] | None = None,
+    text_entries: list[tuple[str, str]] | None = None,
     language: str = "en",
     stt_model: str = "base",
     ffmpeg_location: Path | None = None,
@@ -191,6 +197,7 @@ async def run_batch_voice_clone(
     mode: "youtube" | "upload"
     For YouTube: youtube_url, start_seconds, end_seconds required.
     For upload: audio_paths (list of temp file paths) required.
+    Provide text_entries [(wav_filename, text), ...] or text_lines (converted to line_00.wav, etc).
     """
     if mode == "youtube":
         if not youtube_url or start_seconds is None or end_seconds is None:
@@ -216,12 +223,18 @@ async def run_batch_voice_clone(
     else:
         raise ValueError("mode must be 'youtube' or 'upload'")
 
-    if not text_lines or all(not line.strip() for line in text_lines):
-        raise ValueError("At least one non-empty text line is required")
+    if text_entries is not None:
+        if not text_entries:
+            raise ValueError("text_entries must not be empty")
+    elif text_lines:
+        text_entries = [(f"line_{i:02d}.wav", line.strip()) for i, line in enumerate(text_lines) if line.strip()]
+        if not text_entries:
+            raise ValueError("At least one non-empty text line is required")
+    else:
+        raise ValueError("Provide text_lines or text_entries")
 
-    text_lines = [line.strip() for line in text_lines if line.strip()]
     total_sources = len(sources)
-    logger.info("[Batch] run_batch_voice_clone started: mode=%s, sources=%s, text_lines=%s", mode, total_sources, len(text_lines))
+    logger.info("[Batch] run_batch_voice_clone started: mode=%s, sources=%s, entries=%s", mode, total_sources, len(text_entries))
 
     def _progress(s_idx: int, l_idx: int, tot_s: int, tot_l: int) -> None:
         if progress_callback:
@@ -294,7 +307,7 @@ async def run_batch_voice_clone(
                     source_index,
                     output_prefix,
                     output_folder,
-                    text_lines,
+                    text_entries,
                     language,
                     stt_model,
                     _progress,

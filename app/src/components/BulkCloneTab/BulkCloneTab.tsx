@@ -1,6 +1,7 @@
-import { Download, Loader2, Upload } from 'lucide-react';
+import { Download, FileJson, Loader2, Upload } from 'lucide-react';
 import { useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import {
@@ -48,30 +49,70 @@ export function BulkCloneTab() {
   const [sttModel, setSttModel] = useState('base');
   const [audioFileCount, setAudioFileCount] = useState(0);
   const [hasTextFile, setHasTextFile] = useState(false);
+  const [textInputMode, setTextInputMode] = useState<'type' | 'txt' | 'json'>('type');
+  const [hasJsonFile, setHasJsonFile] = useState(false);
+  const [jsonFile, setJsonFile] = useState<File | null>(null);
 
   const textFileRef = useRef<HTMLInputElement>(null);
+  const jsonFileRef = useRef<HTMLInputElement>(null);
   const audioFilesRef = useRef<HTMLInputElement>(null);
 
+  const EXAMPLE_JSON = `{
+  "categories": {
+    "greetings": {
+      "wavs": [
+        { "wav": "hello.wav", "text": "hello" },
+        { "wav": "yes.wav", "text": "yes" },
+        { "wav": "okay.wav", "text": "okay" }
+      ]
+    }
+  }
+}`;
+
   const handleRun = async () => {
-    const lines = textLines
-      .trim()
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    if (lines.length === 0) {
-      toast({
-        title: 'Text required',
-        description: 'Enter at least one phrase per line, or upload a .txt file.',
-        variant: 'destructive',
-      });
-      return;
+    if (textInputMode === 'json') {
+      if (!jsonFile || !hasJsonFile) {
+        toast({
+          title: 'JSON file required',
+          description: 'Upload a JSON file matching the schema.',
+          variant: 'destructive',
+        });
+        return;
+      }
+    } else {
+      const lines = textLines
+        .trim()
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      if (lines.length === 0) {
+        toast({
+          title: 'Text required',
+          description: 'Enter at least one phrase per line, or upload a .txt or .json file.',
+          variant: 'destructive',
+        });
+        return;
+      }
     }
 
     const formData = new FormData();
     formData.append('mode', mode);
-    formData.append('text', lines.join('\n'));
     formData.append('language', language);
     formData.append('stt_model', sttModel);
+    formData.append('text_input_mode', textInputMode);
+
+    if (textInputMode === 'json' && jsonFile && hasJsonFile) {
+      formData.append('json_file', jsonFile);
+    } else if (textInputMode === 'txt' && textFileRef.current?.files?.[0] && hasTextFile) {
+      formData.append('text_file', textFileRef.current.files[0]);
+    } else {
+      const lines = textLines
+        .trim()
+        .split('\n')
+        .map((l) => l.trim())
+        .filter(Boolean);
+      formData.append('text', lines.join('\n'));
+    }
 
     if (mode === 'youtube') {
       if (!youtubeUrl.trim()) {
@@ -108,12 +149,6 @@ export function BulkCloneTab() {
       }
     }
 
-    const textFile = textFileRef.current?.files?.[0];
-    if (textFile && hasTextFile) {
-      formData.delete('text');
-      formData.append('text_file', textFile);
-    }
-
     try {
       await startBatchClone(formData);
       toast({
@@ -141,6 +176,12 @@ export function BulkCloneTab() {
     }
   };
 
+  const handleJsonFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null;
+    setHasJsonFile(!!file);
+    setJsonFile(file);
+  };
+
   const handleDownloadZip = () => {
     if (downloadZipUrl) {
       window.open(downloadZipUrl, '_blank');
@@ -148,7 +189,9 @@ export function BulkCloneTab() {
   };
 
   const hasText =
-    textLines.trim().split('\n').filter(Boolean).length > 0 || hasTextFile;
+    textInputMode === 'json'
+      ? hasJsonFile
+      : textLines.trim().split('\n').filter(Boolean).length > 0 || hasTextFile;
   const canRun =
     !isStarting &&
     !batchId &&
@@ -224,25 +267,70 @@ export function BulkCloneTab() {
         </Tabs>
 
         <div className="mt-6 space-y-4">
-          <div className="space-y-2">
-            <Label htmlFor="text-lines">Text (one phrase per line)</Label>
-            <Textarea
-              id="text-lines"
-              placeholder="What is your name?&#10;Where are you from?&#10;What do you do for a living?"
-              rows={5}
-              value={textLines}
-              onChange={(e) => setTextLines(e.target.value)}
-            />
-            <p className="text-sm text-muted-foreground">
-              Each line becomes a separate output audio file per source voice. Or upload a .txt file:
-            </p>
-            <Input
-              ref={textFileRef}
-              type="file"
-              accept=".txt"
-              onChange={handleTextFileChange}
-              className="max-w-xs"
-            />
+          <div className="space-y-3">
+            <Label>Text for TTS</Label>
+            <Tabs
+              value={textInputMode}
+              onValueChange={(v) => setTextInputMode(v as 'type' | 'txt' | 'json')}
+              className="w-full"
+            >
+              <TabsList className="grid w-full max-w-md grid-cols-3">
+                <TabsTrigger value="type">Type / Paste</TabsTrigger>
+                <TabsTrigger value="txt">Upload TXT</TabsTrigger>
+                <TabsTrigger value="json">Upload JSON</TabsTrigger>
+              </TabsList>
+              <TabsContent value="type" className="mt-3 space-y-2">
+                <Textarea
+                  id="text-lines"
+                  placeholder="What is your name?&#10;Where are you from?&#10;What do you do for a living?"
+                  rows={5}
+                  value={textLines}
+                  onChange={(e) => setTextLines(e.target.value)}
+                />
+                <p className="text-sm text-muted-foreground">
+                  Each line becomes a separate output audio file per source voice.
+                </p>
+              </TabsContent>
+              <TabsContent value="txt" className="mt-3 space-y-2">
+                <Input
+                  ref={textFileRef}
+                  type="file"
+                  accept=".txt"
+                  onChange={handleTextFileChange}
+                  className="max-w-xs"
+                />
+                <p className="text-sm text-muted-foreground">
+                  Upload a .txt file with one phrase per line.
+                </p>
+              </TabsContent>
+              <TabsContent value="json" className="mt-3 space-y-3">
+                <div className="space-y-2">
+                  <Input
+                    ref={jsonFileRef}
+                    type="file"
+                    accept=".json,application/json"
+                    onChange={handleJsonFileChange}
+                    className="max-w-xs"
+                  />
+                  <p className="text-sm text-muted-foreground">
+                    Upload a JSON file matching the schema below. The <code className="rounded bg-muted px-1 py-0.5 text-xs">wav</code> key is the output filename; <code className="rounded bg-muted px-1 py-0.5 text-xs">text</code> is sent to TTS.
+                  </p>
+                </div>
+                <Card className="border-muted bg-muted/30">
+                  <CardHeader className="pb-2">
+                    <CardTitle className="text-sm font-medium flex items-center gap-2">
+                      <FileJson className="h-4 w-4" />
+                      Example JSON schema
+                    </CardTitle>
+                  </CardHeader>
+                  <CardContent className="pt-0">
+                    <pre className="overflow-x-auto rounded-md border bg-background p-4 text-xs">
+                      <code className="text-foreground">{EXAMPLE_JSON}</code>
+                    </pre>
+                  </CardContent>
+                </Card>
+              </TabsContent>
+            </Tabs>
           </div>
 
           <div className="flex flex-wrap gap-4">
