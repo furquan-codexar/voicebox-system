@@ -279,7 +279,7 @@ async def _process_video(
             language=language,
         )
         out_path = output_folder / f"video_{row_index:02d}_q{q_idx:02d}.wav"
-        save_audio(audio_out, str(out_path), sample_rate)
+        save_audio(audio_out, str(out_path), sample_rate, leading_silence_seconds=0.5)
     logging.info("Row %s: generated %s files", row_index, len(questions))
 
 

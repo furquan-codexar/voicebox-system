@@ -960,7 +960,7 @@ async def export_story_audio(
         tmp_path = tmp.name
 
     try:
-        save_audio(final_audio, tmp_path, sample_rate)
+        save_audio(final_audio, tmp_path, sample_rate, leading_silence_seconds=0.5)
 
         # Read file bytes
         with open(tmp_path, 'rb') as f:

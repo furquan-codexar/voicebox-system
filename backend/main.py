@@ -55,13 +55,14 @@ app = FastAPI(
     version=__version__,
 )
 
-# CORS middleware
+# CORS middleware (expose_headers so frontend can read Content-Disposition for download filename)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],  # Configure appropriately for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition"],
 )
 
 
@@ -617,7 +618,7 @@ async def generate_speech(
         audio_path = config.get_generations_dir() / f"{generation_id}.wav"
 
         from .utils.audio import save_audio
-        save_audio(audio, str(audio_path), sample_rate)
+        save_audio(audio, str(audio_path), sample_rate, leading_silence_seconds=0.5)
 
         # Create history entry
         generation = await history.create_generation(
@@ -949,20 +950,36 @@ def _parse_json_corpus(content: str) -> list[tuple[str, str]]:
     return entries
 
 
+def _sanitize_zip_filename(name: Optional[str]) -> Optional[str]:
+    """Return a safe filename for ZIP download, or None to use default."""
+    if not name or not (s := name.strip()):
+        return None
+    # Keep only the base name (no path)
+    base = Path(s).name
+    base = "".join(c for c in base if c.isalnum() or c in "._- ")
+    base = base.strip() or None
+    if not base:
+        return None
+    if not base.lower().endswith(".zip"):
+        base = f"{base}.zip"
+    return base[:200] if len(base) > 200 else base
+
+
 @app.post("/voice-clone/batch", response_model=models.BatchCloneResponse)
 async def start_batch_voice_clone(
+    text_file: Optional[UploadFile] = File(None),
+    json_file: Optional[UploadFile] = File(None),
+    audio_files: List[UploadFile] = File(default=[]),
     mode: str = Form(...),
     youtube_url: Optional[str] = Form(None),
     start_seconds: Optional[str] = Form(None),
     end_seconds: Optional[str] = Form(None),
     text: Optional[str] = Form(None),
-    text_file: Optional[UploadFile] = File(None),
-    json_file: Optional[UploadFile] = File(None),
     text_input_mode: Optional[str] = Form(None),
     language: str = Form("en"),
     stt_model: str = Form("base"),
-    audio_files: List[UploadFile] = File(default=[]),
     ffmpeg_location: Optional[str] = Form(None),
+    output_zip_name: Optional[str] = Form(None),
 ):
     """Start a batch voice clone. Returns batch_id for status polling and ZIP download."""
     batch_id = str(uuid.uuid4())
@@ -1060,8 +1077,12 @@ async def start_batch_voice_clone(
         )
 
     total_sources = 1 if mode_lower == "youtube" else max(1, len(audio_file_data))
-    logger.info("[API] Batch %s: %s sources, %s text entries, language=%s, stt_model=%s", batch_id[:8], total_sources, num_lines, language, stt_model)
-    start_batch(batch_id, total_sources, num_lines)
+    zip_filename = _sanitize_zip_filename(output_zip_name)
+    logger.info(
+        "[API] Batch %s: output_zip_name=%s -> zip_filename=%s; %s sources, %s lines",
+        batch_id[:8], output_zip_name, zip_filename, total_sources, num_lines,
+    )
+    start_batch(batch_id, total_sources, num_lines, zip_filename=zip_filename)
 
     async def run_batch():
         logger.info("[API] Batch %s: background task started, calling run_batch_voice_clone", batch_id[:8])
@@ -1147,9 +1168,9 @@ async def get_batch_clone_status(batch_id: str):
 @app.get("/voice-clone/batch/{batch_id}/zip")
 async def download_batch_clone_zip(batch_id: str):
     """Download the ZIP file when batch is complete."""
+    state = get_batch_status(batch_id)
     zip_bytes = get_batch_zip(batch_id)
     if zip_bytes is None:
-        state = get_batch_status(batch_id)
         if not state:
             logger.info("[API] GET /voice-clone/batch/%s/zip: 404 batch not found", batch_id[:8])
             raise HTTPException(status_code=404, detail="Batch not found")
@@ -1160,11 +1181,14 @@ async def download_batch_clone_zip(batch_id: str):
             logger.info("[API] GET /voice-clone/batch/%s/zip: 400 batch failed", batch_id[:8])
             raise HTTPException(status_code=400, detail=state.error or "Batch failed")
 
-    logger.info("[API] GET /voice-clone/batch/%s/zip: 200 serving ZIP (%.1f KB)", batch_id[:8], len(zip_bytes) / 1024)
+    filename = (state and state.zip_filename) or "voice-clone-batch.zip"
+    # Ensure filename is safe for Content-Disposition
+    safe_filename = _sanitize_zip_filename(filename) or "voice-clone-batch.zip"
+    logger.info("[API] GET /voice-clone/batch/%s/zip: 200 serving ZIP (%.1f KB) as %s", batch_id[:8], len(zip_bytes) / 1024, safe_filename)
     return StreamingResponse(
         io.BytesIO(zip_bytes),
         media_type="application/zip",
-        headers={"Content-Disposition": 'attachment; filename="voice-clone-batch.zip"'},
+        headers={"Content-Disposition": f'attachment; filename="{safe_filename}"'},
     )
 
 

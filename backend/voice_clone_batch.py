@@ -36,6 +36,7 @@ from .utils.audio import (
 
 TTS_MODEL_SIZE = "1.7B"
 REFERENCE_MAX_DURATION = 30.0
+LEADING_SILENCE_SECONDS = 0.5
 TRAILING_SILENCE_SECONDS = 2.0
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
 
@@ -169,6 +170,7 @@ async def _process_source_and_generate(
             audio_out,
             str(out_path),
             sample_rate,
+            leading_silence_seconds=LEADING_SILENCE_SECONDS,
             trailing_silence_seconds=TRAILING_SILENCE_SECONDS,
         )
         output_paths.append(out_path)

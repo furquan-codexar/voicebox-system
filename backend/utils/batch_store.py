@@ -22,9 +22,15 @@ class BatchCloneState:
     zip_bytes: Optional[bytes] = None
     error: Optional[str] = None
     filenames: list[str] = field(default_factory=list)
+    zip_filename: Optional[str] = None  # optional custom name for download
 
 
-def start_batch(batch_id: str, total_sources: int, total_lines: int) -> None:
+def start_batch(
+    batch_id: str,
+    total_sources: int,
+    total_lines: int,
+    zip_filename: Optional[str] = None,
+) -> None:
     """Mark batch as started."""
     _batch_store[batch_id] = BatchCloneState(
         batch_id=batch_id,
@@ -33,6 +39,7 @@ def start_batch(batch_id: str, total_sources: int, total_lines: int) -> None:
         total_lines=total_lines,
         current_source=0,
         current_line=0,
+        zip_filename=zip_filename,
     )
     logger.info("[BatchStore] Batch %s started: %s sources, %s text lines", batch_id[:8], total_sources, total_lines)
 

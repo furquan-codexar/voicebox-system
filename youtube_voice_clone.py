@@ -267,7 +267,7 @@ async def _process_reference_segment(
             language=language,
         )
         out_path = output_folder / f"{output_prefix}_{index:02d}_q{q_idx:02d}.wav"
-        save_audio(audio_out, str(out_path), sample_rate)
+        save_audio(audio_out, str(out_path), sample_rate, leading_silence_seconds=0.5)
     logging.info("%s %s: generated %s files", output_prefix, index, len(questions))
 
 
