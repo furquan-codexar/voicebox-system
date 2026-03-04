@@ -12,8 +12,10 @@ as a ZIP archive.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
+import multiprocessing
 import re
 import shutil
 import subprocess
@@ -25,6 +27,15 @@ from typing import Callable
 
 import numpy as np
 
+
+class BatchCancelled(Exception):
+    """Raised when the user requested to stop the batch."""
+    def __init__(self, current_source: int, current_line: int) -> None:
+        self.current_source = current_source
+        self.current_line = current_line
+        super().__init__(f"Batch cancelled at source {current_source}, line {current_line}")
+
+from . import config
 from .tts import get_tts_model
 from .transcribe import get_whisper_model
 from .utils.audio import (
@@ -33,12 +44,15 @@ from .utils.audio import (
     validate_reference_audio,
     normalize_audio,
 )
+from .utils.batch_store import append_batch_log, update_batch_worker_stats
 
 TTS_MODEL_SIZE = "1.7B"
 REFERENCE_MAX_DURATION = 30.0
 LEADING_SILENCE_SECONDS = 0.5
 TRAILING_SILENCE_SECONDS = 2.0
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".flac", ".ogg", ".m4a"}
+# Max concurrent TTS generations per source (avoids GPU/CPU overload)
+MAX_CONCURRENT_GENERATIONS = 4
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +122,69 @@ def _download_youtube_audio(
     return candidates[0]
 
 
+async def _generate_one(
+    semaphore: asyncio.Semaphore,
+    tts_model,
+    voice_prompt: dict,
+    line_idx: int,
+    out_name: str,
+    text: str,
+    language: str,
+    output_folder: Path,
+    source_index: int,
+    total_sources: int,
+    total_entries: int,
+    progress_callback: Callable[[int, int, int, int], None] | None,
+    leading_silence_seconds: float = LEADING_SILENCE_SECONDS,
+    trailing_silence_seconds: float = TRAILING_SILENCE_SECONDS,
+) -> tuple[int, Path]:
+    """Generate one WAV; used inside semaphore for bounded parallelism."""
+    async with semaphore:
+        audio_out, sample_rate = await tts_model.generate(
+            text,
+            voice_prompt,
+            language=language,
+        )
+        if total_sources > 1:
+            out_name = f"{source_index:02d}_{out_name}"
+        out_path = output_folder / out_name
+        save_audio(
+            audio_out,
+            str(out_path),
+            sample_rate,
+            leading_silence_seconds=leading_silence_seconds,
+            trailing_silence_seconds=trailing_silence_seconds,
+        )
+        if progress_callback:
+            progress_callback(source_index, line_idx + 1, total_sources, total_entries)
+        return (line_idx, out_path)
+
+
+async def _get_voice_prompt_for_segment(
+    segment_path: Path,
+    source_index: int,
+    language: str,
+    stt_model: str,
+) -> dict:
+    """Validate segment, transcribe with Whisper, create TTS voice prompt. Returns voice_prompt dict."""
+    is_valid, err = validate_reference_audio(str(segment_path))
+    if not is_valid:
+        raise ValueError(f"Invalid reference audio for source {source_index}: {err}")
+    tts_model = get_tts_model()
+    whisper_model = get_whisper_model()
+    await whisper_model.load_model_async(stt_model)
+    transcript = await whisper_model.transcribe(str(segment_path), language=language or None)
+    if not (transcript and transcript.strip()):
+        raise ValueError(f"Empty transcript for source {source_index}")
+    await tts_model.load_model_async(TTS_MODEL_SIZE)
+    voice_prompt, _ = await tts_model.create_voice_prompt(
+        str(segment_path),
+        transcript.strip(),
+        use_cache=False,
+    )
+    return voice_prompt
+
+
 async def _process_source_and_generate(
     segment_path: Path,
     source_index: int,
@@ -118,6 +195,9 @@ async def _process_source_and_generate(
     stt_model: str,
     progress_callback: Callable[[int, int, int, int], None] | None,
     total_sources: int,
+    batch_id: str | None = None,
+    leading_silence_seconds: float = LEADING_SILENCE_SECONDS,
+    trailing_silence_seconds: float = TRAILING_SILENCE_SECONDS,
 ) -> list[Path]:
     """
     Validate, transcribe, create voice prompt, generate for each (out_name, text) entry.
@@ -129,17 +209,23 @@ async def _process_source_and_generate(
         raise ValueError(f"Invalid reference audio for source {source_index}: {err}")
 
     logger.info("[Batch] Source %s: validated segment (2-30s, no clipping)", source_index)
+    if batch_id:
+        append_batch_log(batch_id, f"Source {source_index + 1}/{total_sources} validated.")
 
     tts_model = get_tts_model()
     whisper_model = get_whisper_model()
 
     logger.info("[Batch] Source %s: loading Whisper model '%s' for transcription", source_index, stt_model)
+    if batch_id:
+        append_batch_log(batch_id, f"Transcribing source {source_index + 1}.")
     await whisper_model.load_model_async(stt_model)
     transcript = await whisper_model.transcribe(str(segment_path), language=language or None)
     if not (transcript and transcript.strip()):
         raise ValueError(f"Empty transcript for source {source_index}")
 
     logger.info("[Batch] Source %s: transcribed (length=%d chars)", source_index, len(transcript.strip()))
+    if batch_id:
+        append_batch_log(batch_id, f"Source {source_index + 1} transcribed.")
 
     logger.info("[Batch] Source %s: loading TTS model '%s', creating voice prompt", source_index, TTS_MODEL_SIZE)
     await tts_model.load_model_async(TTS_MODEL_SIZE)
@@ -148,35 +234,204 @@ async def _process_source_and_generate(
         transcript.strip(),
         use_cache=False,
     )
+    if batch_id:
+        append_batch_log(batch_id, "Voice prompt created.")
+        update_batch_worker_stats(
+            batch_id, workers_loaded=1, current_phase="generating"
+        )
 
     total_entries = len(text_entries)
-    logger.info("[Batch] Source %s: voice prompt created, generating %s outputs", source_index, total_entries)
+    logger.info("[Batch] Source %s: voice prompt created, generating %s outputs (parallel, max %s)", source_index, total_entries, MAX_CONCURRENT_GENERATIONS)
+    if batch_id:
+        append_batch_log(batch_id, f"Generating {total_entries} line(s).")
 
-    output_paths = []
-    for line_idx, (out_name, text) in enumerate(text_entries):
-        if progress_callback:
-            progress_callback(source_index, line_idx + 1, total_sources, total_entries)
-        logger.info("[Batch] Source %s: generating %s/%s: %s -> %s", source_index, line_idx + 1, total_entries, text[:50] + "..." if len(text) > 50 else text, out_name)
-        audio_out, sample_rate = await tts_model.generate(
-            text,
+    semaphore = asyncio.Semaphore(MAX_CONCURRENT_GENERATIONS)
+    tasks = [
+        _generate_one(
+            semaphore,
+            tts_model,
             voice_prompt,
-            language=language,
+            line_idx,
+            out_name,
+            text,
+            language,
+            output_folder,
+            source_index,
+            total_sources,
+            total_entries,
+            progress_callback,
+            leading_silence_seconds=leading_silence_seconds,
+            trailing_silence_seconds=trailing_silence_seconds,
         )
-        # For multiple sources, prefix with source index to avoid ZIP filename collisions
-        if total_sources > 1:
-            out_name = f"{source_index:02d}_{out_name}"
-        out_path = output_folder / out_name
-        save_audio(
-            audio_out,
-            str(out_path),
-            sample_rate,
-            leading_silence_seconds=LEADING_SILENCE_SECONDS,
-            trailing_silence_seconds=TRAILING_SILENCE_SECONDS,
-        )
-        output_paths.append(out_path)
+        for line_idx, (out_name, text) in enumerate(text_entries)
+    ]
+    results = await asyncio.gather(*tasks)
+    output_paths = [out_path for _, out_path in sorted(results, key=lambda x: x[0])]
 
     logger.info("[Batch] Source %s: generated %s files", source_index, len(output_paths))
     return output_paths
+
+
+def _worker_process(
+    task_queue: multiprocessing.Queue,
+    result_queue: multiprocessing.Queue,
+    output_folder_str: str,
+    model_size: str,
+    leading_silence_seconds: float = LEADING_SILENCE_SECONDS,
+    trailing_silence_seconds: float = TRAILING_SILENCE_SECONDS,
+) -> None:
+    """
+    Worker process: load TTS model once, then pull tasks and generate.
+    Each task is (line_idx, out_name, text, voice_prompt, language).
+    Puts (line_idx, path_str) into result_queue for each result.
+    Exits when task_queue.get() returns None.
+    """
+    import os
+    worker_pid = os.getpid()
+    logger.info("[Batch] Worker (pid %s) started", worker_pid)
+    try:
+        tts = get_tts_model()
+        tts._load_model_sync(model_size)
+        logger.info("[Batch] Worker (pid %s) loaded TTS model", worker_pid)
+    except Exception as e:
+        logger.exception("[Batch] Worker (pid %s) failed to load model: %s", worker_pid, e)
+        result_queue.put(("error", str(e)))
+        return
+    output_folder = Path(output_folder_str)
+    while True:
+        try:
+            task = task_queue.get()
+        except Exception:
+            break
+        if task is None:
+            break
+        line_idx, out_name, text, voice_prompt, language = task
+        logger.info("[Batch] Worker (pid %s) generating line %s", worker_pid, line_idx)
+        try:
+            audio_out, sample_rate = tts.generate_sync(text, voice_prompt, language=language)
+            out_path = output_folder / out_name
+            save_audio(
+                audio_out,
+                str(out_path),
+                sample_rate,
+                leading_silence_seconds=leading_silence_seconds,
+                trailing_silence_seconds=trailing_silence_seconds,
+            )
+            result_queue.put((line_idx, str(out_path)))
+            logger.info("[Batch] Worker (pid %s) completed line %s", worker_pid, line_idx)
+        except Exception as e:
+            logger.exception("[Batch] Worker (pid %s) failed line %s: %s", worker_pid, line_idx, e)
+            result_queue.put(("error", (line_idx, str(e))))
+
+
+def _run_batch_with_workers_sync(
+    batch_id: str,
+    output_folder: Path,
+    text_entries: list[tuple[str, str]],
+    voice_prompt: dict,
+    language: str,
+    num_workers: int,
+    source_index: int,
+    total_sources: int,
+    progress_callback: Callable[[int, int, int, int], None] | None,
+    leading_silence_seconds: float = LEADING_SILENCE_SECONDS,
+    trailing_silence_seconds: float = TRAILING_SILENCE_SECONDS,
+) -> list[Path]:
+    """
+    Run TTS generation for one source using N worker processes.
+    Returns ordered list of output paths (one per text entry). Blocking.
+    """
+    X = len(text_entries)
+    if batch_id:
+        append_batch_log(batch_id, f"Starting {num_workers} worker process(es).")
+        update_batch_worker_stats(
+            batch_id,
+            current_phase="loading_workers",
+            tasks_total=X,
+            tasks_completed=0,
+            tasks_waiting=X,
+        )
+    out_name_for = (
+        (lambda idx, name: f"{source_index:02d}_{name}")
+        if total_sources > 1
+        else (lambda idx, name: name)
+    )
+    tasks = [
+        (line_idx, out_name_for(line_idx, out_name), text, voice_prompt, language)
+        for line_idx, (out_name, text) in enumerate(text_entries)
+    ]
+    if batch_id:
+        append_batch_log(batch_id, f"Task queue filled with {X} task(s).")
+    ctx = multiprocessing.get_context("spawn")
+    task_queue = ctx.Queue()
+    result_queue = ctx.Queue()
+    for t in tasks:
+        task_queue.put(t)
+    for _ in range(num_workers):
+        task_queue.put(None)
+    processes = [
+        ctx.Process(
+            target=_worker_process,
+            args=(
+                task_queue,
+                result_queue,
+                str(output_folder),
+                TTS_MODEL_SIZE,
+                leading_silence_seconds,
+                trailing_silence_seconds,
+            ),
+        )
+        for _ in range(num_workers)
+    ]
+    for p in processes:
+        p.start()
+    if batch_id:
+        update_batch_worker_stats(batch_id, workers_loaded=num_workers)
+    results: dict[int, Path] = {}
+    while len(results) < X:
+        try:
+            item = result_queue.get(timeout=600)
+        except Exception as e:
+            for p in processes:
+                p.terminate()
+            raise RuntimeError(f"Timeout or error waiting for results: {e}") from e
+        if isinstance(item, tuple) and len(item) == 2:
+            if item[0] == "error":
+                err_val = item[1]
+                for p in processes:
+                    p.terminate()
+                if isinstance(err_val, tuple):
+                    line_idx, err_msg = err_val
+                    raise RuntimeError(f"Worker failed line {line_idx}: {err_msg}") from None
+                raise RuntimeError(f"Worker failed to load model: {err_val}") from None
+            line_idx, path_str = item
+            if not isinstance(line_idx, int) or line_idx < 0 or line_idx >= X:
+                for p in processes:
+                    p.terminate()
+                raise RuntimeError(f"Worker returned invalid line_idx: {line_idx!r}") from None
+            results[line_idx] = Path(path_str)
+            if batch_id:
+                update_batch_worker_stats(
+                    batch_id,
+                    tasks_completed=len(results),
+                    tasks_waiting=X - len(results),
+                    current_phase="generating",
+                )
+            if progress_callback:
+                progress_callback(source_index, len(results), total_sources, X)
+        else:
+            for p in processes:
+                p.terminate()
+            raise RuntimeError(f"Unexpected result from worker: {type(item).__name__}") from None
+    if batch_id:
+        append_batch_log(batch_id, f"All {X} output(s) generated for source {source_index + 1}.")
+    for p in processes:
+        p.join(timeout=10)
+        if p.is_alive():
+            p.terminate()
+    if len(results) != X or set(results.keys()) != set(range(X)):
+        raise RuntimeError(f"Expected {X} results, got {len(results)}")
+    return [results[i] for i in range(X)]
 
 
 async def run_batch_voice_clone(
@@ -192,6 +447,10 @@ async def run_batch_voice_clone(
     stt_model: str = "base",
     ffmpeg_location: Path | None = None,
     progress_callback: Callable[[int, int, int, int], None] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
+    batch_id: str | None = None,
+    leading_silence_seconds: float = LEADING_SILENCE_SECONDS,
+    trailing_silence_seconds: float = TRAILING_SILENCE_SECONDS,
 ) -> tuple[bytes, list[str]]:
     """
     Run batch voice clone. Returns (zip_bytes, list of output filenames).
@@ -236,11 +495,35 @@ async def run_batch_voice_clone(
         raise ValueError("Provide text_lines or text_entries")
 
     total_sources = len(sources)
-    logger.info("[Batch] run_batch_voice_clone started: mode=%s, sources=%s, entries=%s", mode, total_sources, len(text_entries))
+    num_workers = config.get_tts_workers()
+    X = len(text_entries)
+    total_tasks = total_sources * X
+    logger.info("[Batch] run_batch_voice_clone started: mode=%s, sources=%s, entries=%s, workers=%s", mode, total_sources, X, num_workers)
+
+    if batch_id:
+        append_batch_log(batch_id, f"Batch started: {total_sources} source(s), {X} line(s).")
+        update_batch_worker_stats(
+            batch_id,
+            workers_configured=num_workers,
+            processes_started=num_workers if num_workers > 1 else 1,
+            workers_loaded=0,
+            tasks_total=total_tasks,
+            tasks_completed=0,
+            tasks_waiting=total_tasks,
+            current_phase="starting",
+        )
 
     def _progress(s_idx: int, l_idx: int, tot_s: int, tot_l: int) -> None:
         if progress_callback:
             progress_callback(s_idx, l_idx, tot_s, tot_l)
+        if batch_id and tot_s and tot_l:
+            done = (s_idx) * tot_l + l_idx
+            update_batch_worker_stats(
+                batch_id,
+                tasks_completed=done,
+                tasks_waiting=max(0, total_tasks - done),
+                current_phase="generating",
+            )
 
     all_output_paths: list[Path] = []
 
@@ -250,6 +533,9 @@ async def run_batch_voice_clone(
         output_folder.mkdir()
 
         for source_index, source_type, item in sources:
+            if cancel_check and cancel_check():
+                logger.info("[Batch] Cancel requested at source %s", source_index + 1)
+                raise BatchCancelled(source_index, 0)
             try:
                 logger.info("[Batch] Processing source %s/%s (type=%s)", source_index + 1, total_sources, source_type)
                 if source_type == "youtube":
@@ -304,18 +590,41 @@ async def run_batch_voice_clone(
                     logger.info("[Batch] Upload segment prepared: %s (%.1fs)", audio_path.name, len(trimmed) / sr)
                     output_prefix = "source"
 
-                paths = await _process_source_and_generate(
-                    segment_path,
-                    source_index,
-                    output_prefix,
-                    output_folder,
-                    text_entries,
-                    language,
-                    stt_model,
-                    _progress,
-                    total_sources,
-                )
-                all_output_paths.extend(paths)
+                if num_workers > 1:
+                    voice_prompt = await _get_voice_prompt_for_segment(
+                        segment_path, source_index, language, stt_model
+                    )
+                    paths = await asyncio.to_thread(
+                        _run_batch_with_workers_sync,
+                        batch_id or "",
+                        output_folder,
+                        text_entries,
+                        voice_prompt,
+                        language,
+                        num_workers,
+                        source_index,
+                        total_sources,
+                        _progress,
+                        leading_silence_seconds,
+                        trailing_silence_seconds,
+                    )
+                    all_output_paths.extend(paths)
+                else:
+                    paths = await _process_source_and_generate(
+                        segment_path,
+                        source_index,
+                        output_prefix,
+                        output_folder,
+                        text_entries,
+                        language,
+                        stt_model,
+                        _progress,
+                        total_sources,
+                        batch_id=batch_id,
+                        leading_silence_seconds=leading_silence_seconds,
+                        trailing_silence_seconds=trailing_silence_seconds,
+                    )
+                    all_output_paths.extend(paths)
 
             except Exception as e:
                 logger.exception("[Batch] Source %s failed: %s", source_index, e)
@@ -323,6 +632,10 @@ async def run_batch_voice_clone(
 
         if not all_output_paths:
             raise ValueError("No audio files were generated")
+
+        if batch_id:
+            append_batch_log(batch_id, "Building ZIP.")
+            update_batch_worker_stats(batch_id, current_phase="zipping")
 
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -332,6 +645,9 @@ async def run_batch_voice_clone(
         zip_buffer.seek(0)
         zip_bytes = zip_buffer.read()
         filenames = [p.name for p in all_output_paths]
+
+        if batch_id:
+            append_batch_log(batch_id, f"Complete. {len(filenames)} file(s) in ZIP.")
 
     logger.info("[Batch] Batch voice clone complete: %s files in ZIP (%.1f MB)", len(filenames), len(zip_bytes) / (1024 * 1024))
     return zip_bytes, filenames

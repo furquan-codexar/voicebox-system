@@ -531,8 +531,26 @@ class ApiClient {
     status: string;
     progress?: { current_source: number; current_line: number; total_sources: number; total_lines: number };
     error?: string;
+    logs?: string[];
+    worker_stats?: {
+      workers_configured?: number;
+      workers_loaded?: number;
+      processes_started?: number;
+      tasks_total?: number;
+      tasks_completed?: number;
+      tasks_waiting?: number;
+      current_phase?: string;
+    };
   }> {
     return this.request(`/voice-clone/batch/${batchId}/status`);
+  }
+
+  async stopBatchClone(batchId: string): Promise<{
+    status: string;
+    progress?: { current_source: number; current_line: number; total_sources: number; total_lines: number };
+    error?: string;
+  }> {
+    return this.request(`/voice-clone/batch/${batchId}/stop`, { method: 'POST' });
   }
 
   getBatchCloneZipUrl(batchId: string): string {

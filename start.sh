@@ -21,7 +21,14 @@ WEB_DIR="$REPO_ROOT/web"
 VENV="$BACKEND_DIR/venv"
 VENV_BIN="$VENV/bin"
 
-# Ports (overridable via env)
+# Load .env from repo root if present (e.g. VOICEBOX_TTS_WORKERS, VOICEBOX_BACKEND_PORT)
+if [[ -f "$REPO_ROOT/.env" ]]; then
+  set -a
+  source "$REPO_ROOT/.env"
+  set +a
+fi
+
+# Ports (overridable via env or .env)
 BACKEND_PORT="${VOICEBOX_BACKEND_PORT:-17493}"
 WEB_PORT="${VOICEBOX_WEB_PORT:-5173}"
 

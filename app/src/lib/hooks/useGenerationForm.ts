@@ -16,6 +16,8 @@ const generationSchema = z.object({
   seed: z.number().int().optional(),
   modelSize: z.enum(['1.7B', '0.6B']).optional(),
   instruct: z.string().max(500).optional(),
+  leadingSilenceSeconds: z.number().min(0).max(5),
+  trailingSilenceSeconds: z.number().min(0).max(5),
 });
 
 export type GenerationFormValues = z.infer<typeof generationSchema>;
@@ -47,6 +49,8 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
       seed: undefined,
       modelSize: '1.7B',
       instruct: '',
+      leadingSilenceSeconds: 0.5,
+      trailingSilenceSeconds: 2,
       ...options.defaultValues,
     },
   });
@@ -89,6 +93,8 @@ export function useGenerationForm(options: UseGenerationFormOptions = {}) {
         seed: data.seed,
         model_size: data.modelSize,
         instruct: data.instruct || undefined,
+        leading_silence_seconds: data.leadingSilenceSeconds,
+        trailing_silence_seconds: data.trailingSilenceSeconds,
       });
 
       toast({

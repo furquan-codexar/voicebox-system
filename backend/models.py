@@ -57,6 +57,8 @@ class GenerationRequest(BaseModel):
     seed: Optional[int] = Field(None, ge=0)
     model_size: Optional[str] = Field(default="1.7B", pattern="^(1\\.7B|0\\.6B)$")
     instruct: Optional[str] = Field(None, max_length=500)
+    leading_silence_seconds: Optional[float] = Field(default=0.5, ge=0, le=5)
+    trailing_silence_seconds: Optional[float] = Field(default=2.0, ge=0, le=5)
 
 
 class GenerationResponse(BaseModel):
@@ -320,8 +322,21 @@ class BatchCloneProgress(BaseModel):
     total_lines: int
 
 
+class BatchCloneWorkerStats(BaseModel):
+    """Worker and task stats for batch clone (multi-worker mode)."""
+    workers_configured: Optional[int] = None
+    workers_loaded: Optional[int] = None
+    processes_started: Optional[int] = None
+    tasks_total: Optional[int] = None
+    tasks_completed: Optional[int] = None
+    tasks_waiting: Optional[int] = None
+    current_phase: Optional[str] = None
+
+
 class BatchCloneStatusResponse(BaseModel):
     """Response model for batch clone status."""
     status: str  # "processing" | "complete" | "error"
     progress: Optional[BatchCloneProgress] = None
     error: Optional[str] = None
+    logs: Optional[List[str]] = None
+    worker_stats: Optional[BatchCloneWorkerStats] = None

@@ -3,7 +3,14 @@ import { AnimatePresence, motion } from 'framer-motion';
 import { Loader2, SlidersHorizontal, Sparkles } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
-import { Form, FormControl, FormField, FormItem, FormMessage } from '@/components/ui/form';
+import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form';
 import {
   Select,
   SelectContent,
@@ -11,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Slider } from '@/components/ui/slider';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { LANGUAGE_OPTIONS } from '@/lib/constants/languages';
@@ -422,6 +430,54 @@ export function FloatingGenerateBox({
                             </SelectItem>
                           </SelectContent>
                         </Select>
+                        <FormMessage className="text-xs" />
+                      </FormItem>
+                    )}
+                  />
+                </div>
+                <div className="grid grid-cols-2 gap-3 mt-2">
+                  <FormField
+                    control={form.control}
+                    name="leadingSilenceSeconds"
+                    render={({ field }) => (
+                      <FormItem className="space-y-1">
+                        <FormLabel className="text-xs">Silence before (s)</FormLabel>
+                        <div className="flex items-center gap-2">
+                          <Slider
+                            min={0}
+                            max={5}
+                            step={0.1}
+                            value={[field.value]}
+                            onValueChange={([v]) => field.onChange(v)}
+                            className="flex-1"
+                          />
+                          <span className="text-xs text-muted-foreground w-8 tabular-nums">
+                            {field.value.toFixed(1)}
+                          </span>
+                        </div>
+                        <FormMessage className="text-xs" />
+                      </FormItem>
+                    )}
+                  />
+                  <FormField
+                    control={form.control}
+                    name="trailingSilenceSeconds"
+                    render={({ field }) => (
+                      <FormItem className="space-y-1">
+                        <FormLabel className="text-xs">Silence after (s)</FormLabel>
+                        <div className="flex items-center gap-2">
+                          <Slider
+                            min={0}
+                            max={5}
+                            step={0.1}
+                            value={[field.value]}
+                            onValueChange={([v]) => field.onChange(v)}
+                            className="flex-1"
+                          />
+                          <span className="text-xs text-muted-foreground w-8 tabular-nums">
+                            {field.value.toFixed(1)}
+                          </span>
+                        </div>
                         <FormMessage className="text-xs" />
                       </FormItem>
                     )}

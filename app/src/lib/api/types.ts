@@ -34,6 +34,8 @@ export interface GenerationRequest {
   language: LanguageCode;
   seed?: number;
   model_size?: '1.7B' | '0.6B';
+  leading_silence_seconds?: number;
+  trailing_silence_seconds?: number;
 }
 
 export interface GenerationResponse {

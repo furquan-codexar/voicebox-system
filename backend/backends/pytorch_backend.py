@@ -344,6 +344,31 @@ class PyTorchTTSBackend:
 
         return audio, sample_rate
 
+    def generate_sync(
+        self,
+        text: str,
+        voice_prompt: dict,
+        language: str = "en",
+        seed: Optional[int] = None,
+        instruct: Optional[str] = None,
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Synchronous generation for use in worker processes (no asyncio).
+        Loads model if needed, then runs inference. Returns (audio_array, sample_rate).
+        """
+        if not self.is_loaded():
+            self._load_model_sync(self.model_size)
+        if seed is not None:
+            torch.manual_seed(seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed(seed)
+        wavs, sample_rate = self.model.generate_voice_clone(
+            text=text,
+            voice_clone_prompt=voice_prompt,
+            instruct=instruct,
+        )
+        return wavs[0], sample_rate
+
 
 class PyTorchSTTBackend:
     """PyTorch-based STT backend using Whisper."""

@@ -12,4 +12,6 @@ export type GenerationRequest = {
   seed?: number | null;
   model_size?: string | null;
   instruct?: string | null;
+  leading_silence_seconds?: number | null;
+  trailing_silence_seconds?: number | null;
 };

@@ -4,6 +4,7 @@ Configuration module for voicebox backend.
 Handles data directory configuration for production bundling.
 """
 
+import os
 from pathlib import Path
 
 # Default data directory (used in development)
@@ -57,3 +58,17 @@ def get_models_dir() -> Path:
     path = _data_dir / "models"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_tts_workers() -> int:
+    """
+    Get number of TTS worker processes for batch voice clone (1-12).
+    Read from VOICEBOX_TTS_WORKERS (e.g. in .env); default 4; clamp to 1-12.
+    Note: 8-12 workers is appropriate for GPUs with 40GB+ VRAM;
+    1-4 workers is recommended for GPUs with 8-16GB VRAM.
+    """
+    try:
+        n = int(os.environ.get("VOICEBOX_TTS_WORKERS", "4"))
+    except (TypeError, ValueError):
+        n = 4
+    return max(1, min(12, n))

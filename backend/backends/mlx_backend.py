@@ -378,6 +378,56 @@ class MLXTTSBackend:
 
         return audio, sample_rate
 
+    def generate_sync(
+        self,
+        text: str,
+        voice_prompt: dict,
+        language: str = "en",
+        seed: Optional[int] = None,
+        instruct: Optional[str] = None,
+    ) -> Tuple[np.ndarray, int]:
+        """
+        Synchronous generation for use in worker processes (no asyncio).
+        Loads model if needed, then runs inference. Returns (audio_array, sample_rate).
+        """
+        if not self.is_loaded():
+            self._load_model_sync(self.model_size)
+        audio_chunks = []
+        sample_rate = 24000
+        if seed is not None:
+            import mlx.core as mx
+            np.random.seed(seed)
+            mx.random.seed(seed)
+        ref_audio = voice_prompt.get("ref_audio") or voice_prompt.get("ref_audio_path")
+        ref_text = voice_prompt.get("ref_text", "")
+        if ref_audio and isinstance(ref_audio, str) and not Path(ref_audio).exists():
+            ref_audio = None
+        try:
+            if ref_audio:
+                import inspect
+                sig = inspect.signature(self.model.generate)
+                if "ref_audio" in sig.parameters:
+                    for result in self.model.generate(text, ref_audio=ref_audio, ref_text=ref_text):
+                        audio_chunks.append(np.array(result.audio))
+                        sample_rate = result.sample_rate
+                else:
+                    for result in self.model.generate(text):
+                        audio_chunks.append(np.array(result.audio))
+                        sample_rate = result.sample_rate
+            else:
+                for result in self.model.generate(text):
+                    audio_chunks.append(np.array(result.audio))
+                    sample_rate = result.sample_rate
+        except Exception:
+            for result in self.model.generate(text):
+                audio_chunks.append(np.array(result.audio))
+                sample_rate = result.sample_rate
+        if audio_chunks:
+            audio = np.concatenate([np.asarray(chunk, dtype=np.float32) for chunk in audio_chunks])
+        else:
+            audio = np.array([], dtype=np.float32)
+        return audio, sample_rate
+
 
 class MLXSTTBackend:
     """MLX-based STT backend using mlx-audio Whisper."""

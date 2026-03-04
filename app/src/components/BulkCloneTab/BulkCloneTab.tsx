@@ -10,10 +10,12 @@ import {
   FileText,
   Loader2,
   Play,
+  Square,
   Upload,
+  WifiOff,
   Youtube,
 } from 'lucide-react';
-import { useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -26,11 +28,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Slider } from '@/components/ui/slider';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Textarea } from '@/components/ui/textarea';
 import { useToast } from '@/components/ui/use-toast';
 import { LANGUAGE_OPTIONS } from '@/lib/constants/languages';
 import { useBatchClone } from '@/lib/hooks/useBatchClone';
+import { cacheBatchZip, getCachedBatchZip } from '@/lib/utils/batchCloneStorage';
 import { cn } from '@/lib/utils/cn';
 
 const STT_MODELS = [
@@ -43,7 +47,7 @@ const STT_MODELS = [
 
 const AUDIO_EXTENSIONS = '.wav,.mp3,.flac,.ogg,.m4a';
 const CARD_CLASS =
-  'rounded-2xl border border-accent/20 bg-card shadow-sm overflow-hidden';
+  'rounded-2xl border border-accent/20 bg-card shadow-sm overflow-visible shrink-0';
 
 const EXAMPLE_JSON = `{
   "categories": {
@@ -67,12 +71,21 @@ export function BulkCloneTab() {
   const {
     startBatchClone,
     isStarting,
+    stopBatchClone,
+    isStopping,
     batchId,
     status,
     progress,
     error,
+    logs,
+    workerStats,
     downloadZipUrl,
     reset,
+    isStatusError,
+    refetchStatus,
+    isRefetchingStatus,
+    isRestoredBatch,
+    lastKnownStatus,
   } = useBatchClone();
 
   const [mode, setMode] = useState<'youtube' | 'upload'>('youtube');
@@ -90,6 +103,8 @@ export function BulkCloneTab() {
   const [hasJsonFile, setHasJsonFile] = useState(false);
   const [jsonFile, setJsonFile] = useState<File | null>(null);
   const [outputZipName, setOutputZipName] = useState('');
+  const [leadingSilenceSeconds, setLeadingSilenceSeconds] = useState(0.5);
+  const [trailingSilenceSeconds, setTrailingSilenceSeconds] = useState(2);
   const [audioDropActive, setAudioDropActive] = useState(false);
   const [txtDropActive, setTxtDropActive] = useState(false);
   const [jsonSchemaOpen, setJsonSchemaOpen] = useState(false);
@@ -97,6 +112,98 @@ export function BulkCloneTab() {
   const textFileRef = useRef<HTMLInputElement>(null);
   const jsonFileRef = useRef<HTMLInputElement>(null);
   const audioFilesRef = useRef<HTMLInputElement>(null);
+  const hasAutoDownloadedRef = useRef(false);
+  const logPanelRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (logs?.length && logPanelRef.current) {
+      logPanelRef.current.scrollTop = logPanelRef.current.scrollHeight;
+    }
+  }, [logs?.length]);
+
+  const triggerDownload = useCallback(
+    (blob: Blob, filename: string) => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    },
+    [],
+  );
+
+  const parseFilenameFromResponse = useCallback((res: Response): string => {
+    let filename = 'voice-clone-batch.zip';
+    const disp = res.headers.get('Content-Disposition');
+    if (disp) {
+      const match =
+        disp.match(/filename\*?=(?:UTF-8'')?["']?([^"'\s;]+)["']?/i) ??
+        disp.match(/filename=["']?([^"'\s;]+)["']?/i);
+      if (match?.[1]) filename = decodeURIComponent(match[1].trim());
+    }
+    return filename;
+  }, []);
+
+  const handleDownloadZip = useCallback(async () => {
+    if (!batchId) return;
+    try {
+      const cached = await getCachedBatchZip(batchId);
+      if (cached) {
+        triggerDownload(cached, 'voice-clone-batch.zip');
+        return;
+      }
+      if (!downloadZipUrl) {
+        toast({
+          title: 'Download failed',
+          description: 'Check your connection and try again.',
+          variant: 'destructive',
+        });
+        return;
+      }
+      const res = await fetch(downloadZipUrl);
+      if (!res.ok) throw new Error(res.statusText);
+      const blob = await res.blob();
+      const filename = parseFilenameFromResponse(res);
+      await cacheBatchZip(batchId, blob);
+      triggerDownload(blob, filename);
+    } catch (e) {
+      toast({
+        title: 'Download failed',
+        description: e instanceof Error ? e.message : 'Check your connection and try again.',
+        variant: 'destructive',
+      });
+    }
+  }, [batchId, downloadZipUrl, triggerDownload, parseFilenameFromResponse, toast]);
+
+  // Auto-download ZIP when batch completes (once per batch); cache blob for offline download
+  useEffect(() => {
+    if (!batchId) hasAutoDownloadedRef.current = false;
+    if (status !== 'complete' || !downloadZipUrl || hasAutoDownloadedRef.current) return;
+    hasAutoDownloadedRef.current = true;
+    (async () => {
+      try {
+        const cached = await getCachedBatchZip(batchId);
+        if (cached) {
+          triggerDownload(cached, 'voice-clone-batch.zip');
+          return;
+        }
+        const res = await fetch(downloadZipUrl);
+        if (!res.ok) throw new Error(res.statusText);
+        const blob = await res.blob();
+        const filename = parseFilenameFromResponse(res);
+        await cacheBatchZip(batchId, blob);
+        triggerDownload(blob, filename);
+      } catch (e) {
+        hasAutoDownloadedRef.current = false;
+        toast({
+          title: 'Download failed',
+          description: e instanceof Error ? e.message : 'Could not download ZIP',
+          variant: 'destructive',
+        });
+      }
+    })();
+  }, [status, downloadZipUrl, batchId, toast, triggerDownload, parseFilenameFromResponse]);
 
   const handleRun = async () => {
     if (textInputMode === 'json') {
@@ -129,6 +236,8 @@ export function BulkCloneTab() {
     formData.append('language', language);
     formData.append('stt_model', sttModel);
     formData.append('text_input_mode', textInputMode);
+    formData.append('leading_silence_seconds', String(leadingSilenceSeconds));
+    formData.append('trailing_silence_seconds', String(trailingSilenceSeconds));
     if (outputZipName.trim()) {
       formData.append('output_zip_name', outputZipName.trim());
     }
@@ -196,6 +305,23 @@ export function BulkCloneTab() {
     }
   };
 
+  const handleStop = useCallback(() => {
+    if (batchId) {
+      stopBatchClone(batchId).catch((err) => {
+        toast({
+          title: 'Failed to stop batch',
+          description: err instanceof Error ? err.message : 'Unknown error',
+          variant: 'destructive',
+        });
+      });
+    }
+  }, [batchId, stopBatchClone, toast]);
+
+  const handleResume = () => {
+    reset();
+    setTimeout(() => handleRun(), 0);
+  };
+
   const handleTextFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     setHasTextFile(!!file);
@@ -253,33 +379,6 @@ export function BulkCloneTab() {
     }
   };
 
-  const handleDownloadZip = async () => {
-    if (!downloadZipUrl) return;
-    try {
-      const res = await fetch(downloadZipUrl);
-      if (!res.ok) throw new Error(res.statusText);
-      const blob = await res.blob();
-      let filename = 'voice-clone-batch.zip';
-      const disp = res.headers.get('Content-Disposition');
-      if (disp) {
-        const match = disp.match(/filename\*?=(?:UTF-8'')?["']?([^"'\s;]+)["']?/i) ?? disp.match(/filename=["']?([^"'\s;]+)["']?/i);
-        if (match?.[1]) filename = decodeURIComponent(match[1].trim());
-      }
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (e) {
-      toast({
-        title: 'Download failed',
-        description: e instanceof Error ? e.message : 'Could not download ZIP',
-        variant: 'destructive',
-      });
-    }
-  };
-
   const lineCount = textLines
     .trim()
     .split('\n')
@@ -302,9 +401,14 @@ export function BulkCloneTab() {
     (progress?.current_line ?? 0);
   const progressPercent = totalSteps ? Math.min(100, (doneSteps / totalSteps) * 100) : 0;
 
+  const isLogLineError = (line: string) =>
+    /error|failed|Error|Failed/i.test(line);
+
   return (
-    <div className="flex flex-col h-full overflow-auto">
-      <div className="py-6 px-4 max-w-4xl mx-auto w-full space-y-8">
+    <div className="flex flex-col h-full min-h-0 overflow-auto">
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 py-6 px-4 w-full min-w-0 flex-1 min-h-0">
+        {/* Left column: configuration */}
+        <div className="flex flex-col gap-8 overflow-y-auto min-h-0 min-w-0 lg:min-w-[320px]">
         <motion.header
           initial={{ opacity: 0, y: -8 }}
           animate={{ opacity: 1, y: 0 }}
@@ -655,8 +759,45 @@ export function BulkCloneTab() {
               />
             </div>
           </div>
+          <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-4">
+            <div className="space-y-2">
+              <Label className="text-xs">Silence before speech (s)</Label>
+              <div className="flex items-center gap-3">
+                <Slider
+                  min={0}
+                  max={5}
+                  step={0.1}
+                  value={[leadingSilenceSeconds]}
+                  onValueChange={([v]) => setLeadingSilenceSeconds(v)}
+                  className="flex-1"
+                />
+                <span className="text-xs text-muted-foreground w-10 tabular-nums shrink-0">
+                  {leadingSilenceSeconds.toFixed(1)}
+                </span>
+              </div>
+            </div>
+            <div className="space-y-2">
+              <Label className="text-xs">Silence after speech (s)</Label>
+              <div className="flex items-center gap-3">
+                <Slider
+                  min={0}
+                  max={5}
+                  step={0.1}
+                  value={[trailingSilenceSeconds]}
+                  onValueChange={([v]) => setTrailingSilenceSeconds(v)}
+                  className="flex-1"
+                />
+                <span className="text-xs text-muted-foreground w-10 tabular-nums shrink-0">
+                  {trailingSilenceSeconds.toFixed(1)}
+                </span>
+              </div>
+            </div>
+          </div>
         </motion.div>
+        </div>
 
+        {/* Right column: Run + Logs */}
+        <div className="flex flex-col gap-6 overflow-y-auto min-h-0 min-w-0 lg:min-w-[320px]">
         <motion.div
           initial={{ opacity: 0, y: 8 }}
           animate={{ opacity: 1, y: 0 }}
@@ -704,13 +845,37 @@ export function BulkCloneTab() {
                   transition={{ duration: 0.25 }}
                   className="space-y-4"
                 >
-                  {status === 'processing' && (
+                  {isRestoredBatch && (status === undefined || status === 'processing') && (
+                    <p className="text-xs text-muted-foreground">
+                      Resuming previous batch…
+                    </p>
+                  )}
+
+                  {status === 'processing' && !isStatusError && (
                     <div className="space-y-3">
-                      <div className="flex items-center gap-2 text-sm">
-                        <Loader2 className="h-5 w-5 animate-spin shrink-0 text-accent" />
-                        <span className="text-muted-foreground">
-                          Cloning and generating…
-                        </span>
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-sm">
+                          <Loader2 className="h-5 w-5 animate-spin shrink-0 text-accent" />
+                          <span className="text-muted-foreground">
+                            Cloning and generating…
+                          </span>
+                        </div>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="rounded-full shrink-0"
+                          onClick={handleStop}
+                          disabled={isStopping}
+                        >
+                          {isStopping ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <>
+                              <Square className="mr-2 h-4 w-4 fill-current" />
+                              Stop
+                            </>
+                          )}
+                        </Button>
                       </div>
                       <Progress value={progressPercent} className="h-2 rounded-full" />
                       <p className="text-xs text-muted-foreground">
@@ -718,6 +883,91 @@ export function BulkCloneTab() {
                         {' · '}
                         Line {progress?.current_line ?? 0} of {progress?.total_lines ?? 0}
                       </p>
+                      {workerStats && (
+                        <div className="rounded-lg border border-border/50 bg-muted/30 p-3 text-xs">
+                          <p className="font-medium text-muted-foreground mb-2">Backend status</p>
+                          <ul className="space-y-1 text-muted-foreground">
+                            {workerStats.processes_started != null && (
+                              <li>Processes started: {workerStats.processes_started}</li>
+                            )}
+                            {workerStats.workers_loaded != null && (
+                              <li>Workers loaded: {workerStats.workers_loaded}</li>
+                            )}
+                            {workerStats.tasks_total != null && (
+                              <li>Tasks total: {workerStats.tasks_total}</li>
+                            )}
+                            {workerStats.tasks_completed != null && (
+                              <li>Tasks completed: {workerStats.tasks_completed}</li>
+                            )}
+                            {workerStats.tasks_waiting != null && (
+                              <li>Tasks waiting: {workerStats.tasks_waiting}</li>
+                            )}
+                            {workerStats.current_phase && (
+                              <li>Phase: {workerStats.current_phase}</li>
+                            )}
+                          </ul>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {status === 'processing' && isStatusError && (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 space-y-3">
+                      <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 font-medium">
+                        <WifiOff className="h-5 w-5 shrink-0" />
+                        Connection lost
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        The batch may still be running on the server. Check your connection and try again.
+                      </p>
+                      <Button
+                        size="sm"
+                        className="rounded-full"
+                        onClick={() => refetchStatus()}
+                        disabled={isRefetchingStatus}
+                      >
+                        {isRefetchingStatus ? (
+                          <>
+                            <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                            Checking…
+                          </>
+                        ) : (
+                          'Check status'
+                        )}
+                      </Button>
+                    </div>
+                  )}
+
+                  {status === 'stopped' && (
+                    <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-4 space-y-3">
+                      <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 font-medium">
+                        <Square className="h-5 w-5 shrink-0 fill-current" />
+                        Stopped
+                      </div>
+                      <p className="text-sm text-muted-foreground">
+                        Stopped at source {progress?.current_source ?? 0} of {progress?.total_sources ?? 1}
+                        {' · '}
+                        Line {progress?.current_line ?? 0} of {progress?.total_lines ?? 0}.
+                        Click Resume to start a new batch with the same settings.
+                      </p>
+                      <div className="flex flex-wrap gap-2">
+                        <Button size="sm" className="rounded-full" onClick={handleResume} disabled={isStarting}>
+                          {isStarting ? (
+                            <>
+                              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                              Starting…
+                            </>
+                          ) : (
+                            <>
+                              <Play className="mr-2 h-4 w-4" />
+                              Resume
+                            </>
+                          )}
+                        </Button>
+                        <Button variant="outline" size="sm" className="rounded-full" onClick={reset}>
+                          New batch
+                        </Button>
+                      </div>
                     </div>
                   )}
 
@@ -734,16 +984,17 @@ export function BulkCloneTab() {
                     </div>
                   )}
 
-                  {status === 'complete' && (
+                  {(status === 'complete' || (lastKnownStatus === 'complete' && status !== 'error')) && (
                     <div className="space-y-4">
                       <div className="flex items-center gap-2 text-green-600 dark:text-green-400 font-medium">
                         <CheckCircle2 className="h-5 w-5 shrink-0" />
-                        Complete!
+                        {status === 'complete' ? 'Complete! Your ZIP is downloading.' : 'Batch complete.'}
                       </div>
                       <div className="flex flex-wrap gap-2">
                         <Button
+                          size="sm"
+                          className="rounded-full"
                           onClick={handleDownloadZip}
-                          className="rounded-full bg-accent hover:bg-accent/90 hover:scale-[1.02] transition-transform"
                         >
                           <Download className="mr-2 h-4 w-4" />
                           Download ZIP
@@ -759,6 +1010,51 @@ export function BulkCloneTab() {
             </AnimatePresence>
           </div>
         </motion.div>
+
+        {/* Logs panel */}
+        <motion.div
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.3, delay: 0.25 }}
+          className={cn(CARD_CLASS, 'p-0 flex flex-col min-h-0')}
+        >
+          <p className="font-medium text-muted-foreground text-xs uppercase tracking-wider px-5 pt-4 pb-2">
+            Logs
+          </p>
+          <div
+            ref={logPanelRef}
+            className={cn(
+              'flex-1 min-h-[200px] max-h-[320px] overflow-y-auto font-mono text-xs bg-background/50 border-t border-border/50',
+              !logs?.length && 'flex items-center justify-center',
+            )}
+            style={{ scrollBehavior: 'smooth' }}
+            aria-label="Batch logs"
+          >
+            {!logs?.length ? (
+              <p className="text-muted-foreground px-5 py-4 text-center">
+                Logs will appear here when you run a batch.
+              </p>
+            ) : (
+              <div className="divide-y divide-border/30">
+                {logs.map((line, i) => (
+                  <div
+                    key={i}
+                    className={cn(
+                      'py-1.5 px-3 whitespace-pre-wrap break-words border-l-2',
+                      i % 2 === 1 && 'bg-muted/20',
+                      isLogLineError(line)
+                        ? 'border-l-destructive/60 text-destructive'
+                        : 'border-l-transparent text-muted-foreground',
+                    )}
+                  >
+                    {line}
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+        </motion.div>
+        </div>
       </div>
     </div>
   );

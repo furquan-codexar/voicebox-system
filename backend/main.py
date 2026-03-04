@@ -43,6 +43,7 @@ from .utils.batch_store import (
     update_batch_progress,
     complete_batch,
     error_batch,
+    stopped_batch,
     get_batch_status,
     get_batch_zip,
 )
@@ -64,6 +65,10 @@ app.add_middleware(
     allow_headers=["*"],
     expose_headers=["Content-Disposition"],
 )
+
+# Batch voice clone: track running tasks and cancel requests
+_batch_tasks: dict[str, asyncio.Task] = {}
+_batch_cancel_requested: set[str] = set()
 
 
 # ============================================
@@ -611,14 +616,23 @@ async def generate_speech(
             data.instruct,
         )
 
-        # Calculate duration
-        duration = len(audio) / sample_rate
+        leading_silence = data.leading_silence_seconds if data.leading_silence_seconds is not None else 0.5
+        trailing_silence = data.trailing_silence_seconds if data.trailing_silence_seconds is not None else 2.0
 
         # Save audio
         audio_path = config.get_generations_dir() / f"{generation_id}.wav"
 
         from .utils.audio import save_audio
-        save_audio(audio, str(audio_path), sample_rate, leading_silence_seconds=0.5)
+        save_audio(
+            audio,
+            str(audio_path),
+            sample_rate,
+            leading_silence_seconds=leading_silence,
+            trailing_silence_seconds=trailing_silence,
+        )
+
+        # Duration includes added silence
+        duration = len(audio) / sample_rate + leading_silence + trailing_silence
 
         # Create history entry
         generation = await history.create_generation(
@@ -980,6 +994,8 @@ async def start_batch_voice_clone(
     stt_model: str = Form("base"),
     ffmpeg_location: Optional[str] = Form(None),
     output_zip_name: Optional[str] = Form(None),
+    leading_silence_seconds: Optional[float] = Form(0.5),
+    trailing_silence_seconds: Optional[float] = Form(2.0),
 ):
     """Start a batch voice clone. Returns batch_id for status polling and ZIP download."""
     batch_id = str(uuid.uuid4())
@@ -1084,18 +1100,31 @@ async def start_batch_voice_clone(
     )
     start_batch(batch_id, total_sources, num_lines, zip_filename=zip_filename)
 
+    last_progress: list[int] = [0, 0]
+
     async def run_batch():
-        logger.info("[API] Batch %s: background task started, calling run_batch_voice_clone", batch_id[:8])
+        nworkers = config.get_tts_workers()
+        logger.info("[API] Batch %s: background task started (workers=%s), calling run_batch_voice_clone", batch_id[:8], nworkers)
         try:
             ffmpeg_path = Path(ffmpeg_location).resolve() if ffmpeg_location and ffmpeg_location.strip() else None
 
             def progress_cb(s_idx: int, l_idx: int, tot_s: int, tot_l: int):
+                last_progress[0], last_progress[1] = s_idx, l_idx
                 update_batch_progress(batch_id, s_idx, l_idx, tot_s, tot_l)
 
+            def cancel_check() -> bool:
+                return batch_id in _batch_cancel_requested
+
+            leading_s = max(0, min(5, float(leading_silence_seconds or 0.5)))
+            trailing_s = max(0, min(5, float(trailing_silence_seconds or 2.0)))
             batch_kwargs: dict = {
                 "language": language or "en",
                 "stt_model": stt_model.strip().lower(),
                 "progress_callback": progress_cb,
+                "cancel_check": cancel_check,
+                "batch_id": batch_id,
+                "leading_silence_seconds": leading_s,
+                "trailing_silence_seconds": trailing_s,
             }
             if text_entries is not None:
                 batch_kwargs["text_entries"] = text_entries
@@ -1130,14 +1159,71 @@ async def start_batch_voice_clone(
                     )
 
             complete_batch(batch_id, zip_bytes, filenames)
-            logger.info("[API] Batch %s: background task completed successfully", batch_id[:8])
+            logger.info("[API] Batch %s: background task completed successfully (%s files)", batch_id[:8], len(filenames))
+        except voice_clone_batch.BatchCancelled as e:
+            logger.info("[API] Batch %s: stopped by user at source %s, line %s", batch_id[:8], e.current_source + 1, e.current_line)
+            stopped_batch(batch_id, e.current_source, e.current_line)
+        except asyncio.CancelledError:
+            logger.info("[API] Batch %s: task cancelled at source %s, line %s", batch_id[:8], last_progress[0] + 1, last_progress[1])
+            stopped_batch(batch_id, last_progress[0], last_progress[1])
+            raise
         except Exception as e:
             logger.exception("[API] Batch %s: background task failed: %s", batch_id[:8], e)
             error_batch(batch_id, str(e))
+            logger.error("[API] Batch %s: batch failed", batch_id[:8])
+        finally:
+            _batch_tasks.pop(batch_id, None)
+            _batch_cancel_requested.discard(batch_id)
 
-    asyncio.create_task(run_batch())
+    task = asyncio.create_task(run_batch())
+    _batch_tasks[batch_id] = task
     logger.info("[API] Batch %s: background task started, returning 200 to client", batch_id[:8])
     return models.BatchCloneResponse(batch_id=batch_id, status="processing")
+
+
+@app.post("/voice-clone/batch/{batch_id}/stop", response_model=models.BatchCloneStatusResponse)
+async def stop_batch_clone(batch_id: str):
+    """Request the batch to stop. Progress will show as stopped; user can start a new batch (Resume)."""
+    state = get_batch_status(batch_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Batch not found")
+    if state.status != "processing":
+        return models.BatchCloneStatusResponse(
+            status=state.status,
+            progress=models.BatchCloneProgress(
+                current_source=state.current_source,
+                current_line=state.current_line,
+                total_sources=state.total_sources,
+                total_lines=state.total_lines,
+            ) if (state.total_sources or state.total_lines) else None,
+            error=state.error,
+        )
+    _batch_cancel_requested.add(batch_id)
+    task = _batch_tasks.get(batch_id)
+    if task and not task.done():
+        task.cancel()
+    logger.info("[API] POST /voice-clone/batch/%s/stop: cancel requested", batch_id[:8])
+    state = get_batch_status(batch_id)
+    if state:
+        progress = None
+        if state.total_sources or state.total_lines:
+            progress = models.BatchCloneProgress(
+                current_source=state.current_source,
+                current_line=state.current_line,
+                total_sources=state.total_sources,
+                total_lines=state.total_lines,
+            )
+        worker_stats = None
+        if state.worker_stats:
+            worker_stats = models.BatchCloneWorkerStats(**state.worker_stats)
+        return models.BatchCloneStatusResponse(
+            status=state.status,
+            progress=progress,
+            error=state.error,
+            logs=state.logs if state.logs else None,
+            worker_stats=worker_stats,
+        )
+    raise HTTPException(status_code=404, detail="Batch not found")
 
 
 @app.get("/voice-clone/batch/{batch_id}/status", response_model=models.BatchCloneStatusResponse)
@@ -1149,7 +1235,7 @@ async def get_batch_clone_status(batch_id: str):
         raise HTTPException(status_code=404, detail="Batch not found")
 
     progress = None
-    if state.status == "processing" and (state.total_sources or state.total_lines):
+    if state.status in ("processing", "stopped") and (state.total_sources or state.total_lines):
         progress = models.BatchCloneProgress(
             current_source=state.current_source,
             current_line=state.current_line,
@@ -1157,11 +1243,17 @@ async def get_batch_clone_status(batch_id: str):
             total_lines=state.total_lines,
         )
 
+    worker_stats = None
+    if state.worker_stats:
+        worker_stats = models.BatchCloneWorkerStats(**state.worker_stats)
+
     logger.info("[API] GET /voice-clone/batch/%s/status: status=%s", batch_id[:8], state.status)
     return models.BatchCloneStatusResponse(
         status=state.status,
         progress=progress,
         error=state.error,
+        logs=state.logs if state.logs else None,
+        worker_stats=worker_stats,
     )
 
 

@@ -18,6 +18,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
+import { Slider } from '@/components/ui/slider';
 import { Textarea } from '@/components/ui/textarea';
 import { LANGUAGE_OPTIONS } from '@/lib/constants/languages';
 import { useGenerationForm } from '@/lib/hooks/useGenerationForm';
@@ -164,6 +165,57 @@ export function GenerationForm() {
                       />
                     </FormControl>
                     <FormDescription>For reproducible results</FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+            </div>
+
+            <div className="grid gap-4 md:grid-cols-2">
+              <FormField
+                control={form.control}
+                name="leadingSilenceSeconds"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Silence before speech (seconds)</FormLabel>
+                    <div className="flex items-center gap-3">
+                      <Slider
+                        min={0}
+                        max={5}
+                        step={0.1}
+                        value={[field.value]}
+                        onValueChange={([v]) => field.onChange(v)}
+                        className="flex-1"
+                      />
+                      <span className="text-sm text-muted-foreground w-10 tabular-nums">
+                        {field.value.toFixed(1)}s
+                      </span>
+                    </div>
+                    <FormDescription>0–5 seconds of silence before the speech</FormDescription>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <FormField
+                control={form.control}
+                name="trailingSilenceSeconds"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Silence after speech (seconds)</FormLabel>
+                    <div className="flex items-center gap-3">
+                      <Slider
+                        min={0}
+                        max={5}
+                        step={0.1}
+                        value={[field.value]}
+                        onValueChange={([v]) => field.onChange(v)}
+                        className="flex-1"
+                      />
+                      <span className="text-sm text-muted-foreground w-10 tabular-nums">
+                        {field.value.toFixed(1)}s
+                      </span>
+                    </div>
+                    <FormDescription>0–5 seconds of silence after the speech</FormDescription>
                     <FormMessage />
                   </FormItem>
                 )}
