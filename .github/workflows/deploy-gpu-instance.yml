@@ -1,0 +1,603 @@
+# ============================================================
+# Automated GPU Instance Deployment - Massed Compute
+# ============================================================
+# Manual trigger only — developer types the branch name to deploy.
+# Always run this workflow from "main" and enter the target branch
+# in the input field.
+#
+# Required GitHub Secrets:
+#   MASSED_COMPUTE_API_TOKEN  - Your Massed Compute API bearer token
+#   GH_PAT                    - GitHub Personal Access Token (for private repo clone)
+#   MC_SSH_PRIVATE_KEY        - SSH private key matching the key registered on Massed Compute
+#   MC_SSH_KEY_NAME           - Name of the SSH key as registered in Massed Compute dashboard
+#
+# Optional GitHub Secrets (for Teams notifications):
+#   TEAMS_WEBHOOK_URL         - Microsoft Teams Incoming Webhook URL
+#
+# Optional GitHub Variables (Settings > Variables > Actions):
+#   MC_IMAGE_ID               - Massed Compute image ID for Ubuntu 22.04 w/ drivers
+#   MC_PRODUCT_NAME           - Product name (default: gpu_1x_a6000)
+#   MC_COUPON                 - Discount coupon code (default: promptengineering)
+# ============================================================
+
+name: Deploy GPU Instance
+
+on:
+  # Manual trigger — always run from "main", type target branch in the input
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: 'Branch to deploy (type any branch name, e.g. main, dev)'
+        required: true
+        type: string
+
+env:
+  MC_API_BASE: https://vm.massedcompute.com/api/v1
+  MC_PRODUCT_NAME: ${{ vars.MC_PRODUCT_NAME || 'gpu_1x_a6000' }}
+  MC_COUPON: ${{ vars.MC_COUPON || 'promptengineering' }}
+  TEAMS_ENABLED: ${{ secrets.TEAMS_WEBHOOK_URL != '' }}
+
+jobs:
+  # ================================================================
+  # Job 1: Resolve which branch to deploy
+  # ================================================================
+  resolve:
+    name: Resolve deployment target
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Validate branch and build matrix
+        id: set-matrix
+        run: |
+          ACTOR="${{ github.actor }}"
+          BRANCH="${{ inputs.branch }}"
+
+          echo "User: $ACTOR"
+          echo "Branch: $BRANCH"
+
+          # Validate that the branch exists
+          if git ls-remote --exit-code --heads \
+            "https://x-access-token:${{ secrets.GH_PAT }}@github.com/CodexAR-Pvt-Ltd/voicebox-system.git" \
+            "$BRANCH" > /dev/null 2>&1; then
+            echo "Branch '$BRANCH' exists ✓"
+          else
+            echo "ERROR: Branch '$BRANCH' does not exist in voicebox-system"
+            echo ""
+            echo "Available branches:"
+            git ls-remote --heads \
+              "https://x-access-token:${{ secrets.GH_PAT }}@github.com/CodexAR-Pvt-Ltd/voicebox-system.git" \
+              | awk '{print "  " $2}' | sed 's|refs/heads/||'
+            exit 1
+          fi
+
+          MATRIX="{\"include\":[{\"user\":\"$ACTOR\",\"branch\":\"$BRANCH\"}]}"
+          echo "Matrix: $MATRIX"
+          echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
+
+  # ================================================================
+  # Job 2: Deploy GPU instance
+  # ================================================================
+  deploy:
+    name: "Deploy [${{ matrix.branch }}]"
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      matrix: ${{ fromJSON(needs.resolve.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+      # --------------------------------------------------------
+      # Step 1: Resolve the Massed Compute Image ID
+      # --------------------------------------------------------
+      - name: Get Image ID for Ubuntu Server 22.04 w/ drivers
+        id: get-image
+        run: |
+          echo "Fetching available images..."
+
+          HTTP_CODE=$(curl -s -o /tmp/images_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+            "${{ env.MC_API_BASE }}/images")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "Failed to fetch images (HTTP $HTTP_CODE):"
+            cat /tmp/images_response.json
+            exit 1
+          fi
+
+          IMAGES=$(cat /tmp/images_response.json)
+
+          if [ -n "${{ vars.MC_IMAGE_ID }}" ]; then
+            IMAGE_ID="${{ vars.MC_IMAGE_ID }}"
+            echo "Using configured image ID: $IMAGE_ID"
+          else
+            IMAGE_ID=$(echo "$IMAGES" | jq -r '.images[] | select(.vm_image_name | test("Ubuntu.*22\\.04.*driver"; "i")) | .vm_image_id' | head -1)
+
+            if [ -z "$IMAGE_ID" ] || [ "$IMAGE_ID" = "null" ]; then
+              echo "Could not auto-detect image. Available images:"
+              echo "$IMAGES" | jq -r '.images[] | "  ID: \(.vm_image_id) - \(.vm_image_name)"'
+              echo ""
+              echo "ERROR: Set MC_IMAGE_ID in GitHub Variables (Settings > Variables > Actions)"
+              exit 1
+            fi
+            echo "Found image ID: $IMAGE_ID"
+          fi
+
+          echo "image_id=$IMAGE_ID" >> "$GITHUB_OUTPUT"
+
+      # --------------------------------------------------------
+      # Step 2: Validate Coupon
+      # --------------------------------------------------------
+      - name: Validate discount coupon
+        run: |
+          echo "Validating coupon: ${{ env.MC_COUPON }}"
+
+          HTTP_CODE=$(curl -s -o /tmp/coupon_response.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"coupon": "${{ env.MC_COUPON }}"}' \
+            "${{ env.MC_API_BASE }}/coupon/information")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "WARNING: Coupon validation returned HTTP $HTTP_CODE"
+            cat /tmp/coupon_response.json
+            echo "Continuing — the launch step will determine if coupon is accepted."
+          else
+            COUPON_RESPONSE=$(cat /tmp/coupon_response.json)
+            DISCOUNT=$(echo "$COUPON_RESPONSE" | jq -r '.coupon.discountPercent // empty')
+            EXPIRY=$(echo "$COUPON_RESPONSE" | jq -r '.coupon.deactivationDate // empty')
+
+            if [ -z "$DISCOUNT" ]; then
+              echo "WARNING: Coupon '${{ env.MC_COUPON }}' may be invalid or expired."
+              echo "Continuing — launch will determine if coupon is accepted."
+            else
+              DISCOUNT_PCT=$(echo "$DISCOUNT" | awk '{printf "%.0f", $1 * 100}')
+              echo "Coupon valid - Discount: ${DISCOUNT_PCT}% | Expires: ${EXPIRY}"
+            fi
+          fi
+
+      # --------------------------------------------------------
+      # Step 3: Launch the GPU Instance
+      # --------------------------------------------------------
+      - name: "Launch GPU instance for [${{ matrix.branch }}]"
+        id: launch
+        run: |
+          echo "Launching ${{ env.MC_PRODUCT_NAME }} for branch: ${{ matrix.branch }}"
+          echo "Triggered by user: ${{ matrix.user }}"
+
+          INSTANCE_NAME="voicebox-${{ matrix.branch }}-${{ github.run_id }}"
+
+          if [ -n "$MC_SSH_KEY_NAME" ]; then
+            PAYLOAD=$(jq -n \
+              --arg product "${{ env.MC_PRODUCT_NAME }}" \
+              --argjson imageId ${{ steps.get-image.outputs.image_id }} \
+              --arg region "any" \
+              --arg name "$INSTANCE_NAME" \
+              --arg coupon "${{ env.MC_COUPON }}" \
+              --arg sshKey "$MC_SSH_KEY_NAME" \
+              '{
+                productName: $product,
+                imageId: $imageId,
+                regionName: $region,
+                instanceName: $name,
+                coupon: $coupon,
+                sshKeys: [$sshKey]
+              }')
+            echo "Including SSH key '$MC_SSH_KEY_NAME' in launch request"
+          else
+            PAYLOAD=$(jq -n \
+              --arg product "${{ env.MC_PRODUCT_NAME }}" \
+              --argjson imageId ${{ steps.get-image.outputs.image_id }} \
+              --arg region "any" \
+              --arg name "$INSTANCE_NAME" \
+              --arg coupon "${{ env.MC_COUPON }}" \
+              '{
+                productName: $product,
+                imageId: $imageId,
+                regionName: $region,
+                instanceName: $name,
+                coupon: $coupon
+              }')
+            echo "WARNING: No MC_SSH_KEY_NAME secret — launching without SSH key."
+            echo "Will attempt password auth as fallback."
+          fi
+
+          echo "Launch payload (sensitive fields redacted):"
+          echo "$PAYLOAD" | jq 'del(.coupon, .sshKeys)'
+
+          HTTP_CODE=$(curl -s -o /tmp/launch_response.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            "${{ env.MC_API_BASE }}/instance/launch")
+
+          if [ "$HTTP_CODE" -ne 202 ] && [ "$HTTP_CODE" -ne 200 ]; then
+            echo "ERROR: Failed to launch instance (HTTP $HTTP_CODE):"
+            cat /tmp/launch_response.json | jq . 2>/dev/null || cat /tmp/launch_response.json
+            exit 1
+          fi
+
+          INSTANCE_UUID=$(cat /tmp/launch_response.json | jq -r '.response')
+
+          if [ -z "$INSTANCE_UUID" ] || [ "$INSTANCE_UUID" = "null" ]; then
+            echo "ERROR: No instance UUID in response:"
+            cat /tmp/launch_response.json | jq . 2>/dev/null || cat /tmp/launch_response.json
+            exit 1
+          fi
+
+          echo "Instance launched - UUID: $INSTANCE_UUID"
+          echo "uuid=$INSTANCE_UUID" >> "$GITHUB_OUTPUT"
+        env:
+          MC_SSH_KEY_NAME: ${{ secrets.MC_SSH_KEY_NAME }}
+
+      # --------------------------------------------------------
+      # Step 4: Wait for Instance to Boot
+      # --------------------------------------------------------
+      - name: Wait for instance to be ready
+        id: wait-boot
+        run: |
+          UUID="${{ steps.launch.outputs.uuid }}"
+          echo "Waiting for instance $UUID to boot..."
+
+          MAX_ATTEMPTS=60
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+
+            INSTANCE=$(curl -s \
+              -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+              "${{ env.MC_API_BASE }}/instance/$UUID")
+
+            STATUS=$(echo "$INSTANCE" | jq -r '.runningInstances[0].status // empty')
+            OS_BOOTED=$(echo "$INSTANCE" | jq -r '.runningInstances[0].os_booted // empty')
+            IP=$(echo "$INSTANCE" | jq -r '.runningInstances[0].ip // empty')
+            USERNAME=$(echo "$INSTANCE" | jq -r '.runningInstances[0].username // empty')
+            PASSWORD=$(echo "$INSTANCE" | jq -r '.runningInstances[0].password // empty')
+
+            echo "  [$ATTEMPT/$MAX_ATTEMPTS] Status: $STATUS | OS Booted: $OS_BOOTED | IP: $IP"
+
+            if [ "$OS_BOOTED" = "1" ] && [ "$STATUS" = "Running" ] && [ -n "$IP" ]; then
+              echo ""
+              echo "Instance is ready! IP: $IP | User: $USERNAME"
+
+              if [ -n "$PASSWORD" ] && [ "$PASSWORD" != "null" ]; then
+                echo "::add-mask::$PASSWORD"
+              fi
+
+              echo "ip=$IP" >> "$GITHUB_OUTPUT"
+              echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
+              echo "password=$PASSWORD" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "ERROR: Instance failed to boot within 10 minutes"
+          exit 1
+
+      # --------------------------------------------------------
+      # Step 5: Wait for SSH to Become Available
+      # --------------------------------------------------------
+      - name: Wait for SSH availability
+        run: |
+          IP="${{ steps.wait-boot.outputs.ip }}"
+          echo "Waiting for SSH on $IP:22..."
+
+          for i in $(seq 1 30); do
+            if nc -z -w 5 "$IP" 22 2>/dev/null; then
+              echo "SSH port is open"
+              sleep 5
+              exit 0
+            fi
+            echo "  [$i/30] SSH not ready yet..."
+            sleep 10
+          done
+
+          echo "ERROR: SSH did not become available within 5 minutes"
+          exit 1
+
+      # --------------------------------------------------------
+      # Step 6: Setup SSH & Test Connection (key → password fallback)
+      # --------------------------------------------------------
+      - name: Setup SSH and test connection
+        id: ssh-setup
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MC_SSH_PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/mc_key
+          chmod 600 ~/.ssh/mc_key
+
+          IP="${{ steps.wait-boot.outputs.ip }}"
+          USER="${{ steps.wait-boot.outputs.username }}"
+
+          ssh-keyscan -H "$IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+          if ssh -i ~/.ssh/mc_key -o StrictHostKeyChecking=no -o ConnectTimeout=15 -o BatchMode=yes "$USER@$IP" "echo 'key auth ok'" 2>/dev/null; then
+            echo "SSH key authentication successful"
+            echo "auth_method=key" >> "$GITHUB_OUTPUT"
+          else
+            echo "SSH key auth failed — trying password auth..."
+            sudo apt-get update -qq > /dev/null 2>&1
+            sudo apt-get install -y -qq sshpass > /dev/null 2>&1
+
+            if sshpass -p "$MC_PASSWORD" ssh -o StrictHostKeyChecking=no -o ConnectTimeout=15 "$USER@$IP" "echo 'password auth ok'" 2>/dev/null; then
+              echo "Password authentication successful"
+              echo "auth_method=password" >> "$GITHUB_OUTPUT"
+            else
+              echo "ERROR: Both SSH key and password authentication failed!"
+              exit 1
+            fi
+          fi
+        env:
+          MC_PASSWORD: ${{ steps.wait-boot.outputs.password }}
+
+      # --------------------------------------------------------
+      # Step 7: Clone repo & run start.sh (foreground — streams live logs)
+      # --------------------------------------------------------
+      - name: Write remote start script
+        run: |
+          cat > /tmp/remote_start.sh << 'STARTSCRIPT'
+          #!/bin/bash
+          set -eo pipefail
+
+          BRANCH="$1"
+          GH_PAT="$2"
+
+          echo "============================================"
+          echo "  Voicebox GPU Instance - Startup"
+          echo "  Branch: ${BRANCH}"
+          echo "============================================"
+
+          # Pre-flight: Verify GPU is available
+          echo ""
+          echo "[pre-flight] Verifying GPU..."
+          if nvidia-smi > /dev/null 2>&1; then
+            GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1)
+            GPU_MEM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader | head -1)
+            DRIVER=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
+            echo "  GPU:    $GPU_NAME"
+            echo "  VRAM:   $GPU_MEM"
+            echo "  Driver: $DRIVER"
+          else
+            echo "  WARNING: nvidia-smi not found or failed — GPU may not be available."
+          fi
+
+          # Clone the repository
+          echo ""
+          echo "[1/2] Cloning branch '${BRANCH}'..."
+          git clone -b "${BRANCH}" "https://${GH_PAT}@github.com/CodexAR-Pvt-Ltd/voicebox-system.git"
+          echo "  Clone complete"
+
+          # Remove PAT from remote URL
+          cd voicebox-system
+          git remote set-url origin https://github.com/CodexAR-Pvt-Ltd/voicebox-system.git
+
+          # Run start.sh in foreground — all output streams live to GitHub Actions
+          echo ""
+          echo "[2/2] Running start.sh..."
+          echo "============================================"
+          bash start.sh
+          STARTSCRIPT
+
+          chmod +x /tmp/remote_start.sh
+
+      - name: Clone repo and run start.sh on GPU instance
+        id: run-voicebox
+        run: |
+          IP="${{ steps.wait-boot.outputs.ip }}"
+          USER="${{ steps.wait-boot.outputs.username }}"
+          AUTH_METHOD="${{ steps.ssh-setup.outputs.auth_method }}"
+          BRANCH="${{ matrix.branch }}"
+          KEEPALIVE="-o ServerAliveInterval=30 -o ServerAliveCountMax=10"
+
+          if [ "$AUTH_METHOD" = "key" ]; then
+            SSH_OPTS="-i ~/.ssh/mc_key -o StrictHostKeyChecking=no $KEEPALIVE"
+            SCP_CMD="scp -o StrictHostKeyChecking=no -i ~/.ssh/mc_key"
+            SSH_CMD="ssh $SSH_OPTS"
+          else
+            SSH_OPTS="-o StrictHostKeyChecking=no $KEEPALIVE"
+            SCP_CMD="sshpass -p $MC_PASSWORD scp -o StrictHostKeyChecking=no"
+            SSH_CMD="sshpass -p $MC_PASSWORD ssh $SSH_OPTS"
+          fi
+
+          echo "Connecting to $USER@$IP (auth: $AUTH_METHOD) for branch: $BRANCH..."
+
+          # Upload start script
+          $SCP_CMD /tmp/remote_start.sh "$USER@$IP:/tmp/remote_start.sh"
+          echo "Start script uploaded"
+
+          # Execute — runs in foreground so all logs (including the access URL box)
+          # stream live into GitHub Actions. The job stays alive until start.sh exits
+          # or the 90-minute workflow timeout is reached.
+          # PAT is passed as argument (never written inside the script file) for safety.
+          $SSH_CMD "$USER@$IP" "bash /tmp/remote_start.sh '$BRANCH' '$GH_PAT' && rm -f /tmp/remote_start.sh" \
+            | tee /tmp/voicebox_output.txt
+
+          # Parse the Web UI URL from start.sh output for Teams notification
+          WEB_URL=$(grep -oP 'Web UI:\s+\Khttp://[^\s]+' /tmp/voicebox_output.txt | tail -1 || true)
+          API_URL=$(grep -oP 'API:\s+\Khttp://[^\s]+(?=\s)' /tmp/voicebox_output.txt | tail -1 || true)
+          echo "web_url=${WEB_URL}" >> "$GITHUB_OUTPUT"
+          echo "api_url=${API_URL}" >> "$GITHUB_OUTPUT"
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          MC_PASSWORD: ${{ steps.wait-boot.outputs.password }}
+
+      # --------------------------------------------------------
+      # Step 8: Print Instance Access Info
+      # --------------------------------------------------------
+      - name: Print instance details
+        if: success()
+        run: |
+          echo ""
+          echo "============================================"
+          echo "  GPU Instance is Running!"
+          echo "============================================"
+          echo "  UUID:     ${{ steps.launch.outputs.uuid }}"
+          echo "  IP:       ${{ steps.wait-boot.outputs.ip }}"
+          echo "  User:     ${{ steps.wait-boot.outputs.username }}"
+          echo "  Branch:   ${{ matrix.branch }}"
+          echo "  Dev:      ${{ matrix.user }}"
+          echo "  Coupon:   ${{ env.MC_COUPON }}"
+          echo "  Auth:     ${{ steps.ssh-setup.outputs.auth_method }}"
+          echo "  Web UI:   ${{ steps.run-voicebox.outputs.web_url }}"
+          echo "  API:      ${{ steps.run-voicebox.outputs.api_url }}"
+          echo "============================================"
+          echo ""
+          echo "  SSH:  ssh ${{ steps.wait-boot.outputs.username }}@${{ steps.wait-boot.outputs.ip }}"
+          echo ""
+          echo "  To terminate:"
+          echo "  curl -X POST \\"
+          echo "    -H 'Authorization: Bearer <token>' \\"
+          echo "    -H 'Content-Type: application/json' \\"
+          echo "    -d '{\"instanceUuids\": [\"${{ steps.launch.outputs.uuid }}\"]}' \\"
+          echo "    ${{ env.MC_API_BASE }}/instance/terminate"
+          echo ""
+
+      # --------------------------------------------------------
+      # Cleanup: Terminate instance on failure
+      # --------------------------------------------------------
+      - name: "Terminate [${{ matrix.branch }}] instance on failure"
+        if: failure() && steps.launch.outputs.uuid
+        run: |
+          echo "Deployment failed for ${{ matrix.branch }} — terminating instance to avoid charges..."
+
+          HTTP_CODE=$(curl -s -o /tmp/terminate_response.json -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+            -H "Content-Type: application/json" \
+            -d '{"instanceUuids": ["${{ steps.launch.outputs.uuid }}"]}' \
+            "${{ env.MC_API_BASE }}/instance/terminate")
+
+          if [ "$HTTP_CODE" -eq 202 ] || [ "$HTTP_CODE" -eq 200 ]; then
+            echo "Instance terminated — no further charges"
+          else
+            echo "WARNING: Terminate returned HTTP $HTTP_CODE:"
+            cat /tmp/terminate_response.json
+            echo ""
+            echo "MANUAL ACTION REQUIRED!"
+            echo "Terminate instance ${{ steps.launch.outputs.uuid }} via the Massed Compute dashboard!"
+          fi
+
+      # --------------------------------------------------------
+      # Cleanup: Remove SSH key from runner
+      # --------------------------------------------------------
+      - name: Cleanup SSH key
+        if: always()
+        run: rm -f ~/.ssh/mc_key /tmp/remote_start.sh /tmp/voicebox_output.txt
+
+      # --------------------------------------------------------
+      # Notification: Post to Microsoft Teams — success
+      # --------------------------------------------------------
+      - name: Notify Teams — success
+        if: success() && env.TEAMS_ENABLED == 'true'
+        run: |
+          WEB_URL="${{ steps.run-voicebox.outputs.web_url }}"
+          API_URL="${{ steps.run-voicebox.outputs.api_url }}"
+
+          # Fallback if URL parsing found nothing (e.g. start.sh still running)
+          if [ -z "$WEB_URL" ]; then
+            WEB_URL="http://${{ steps.wait-boot.outputs.ip }}:5173"
+          fi
+          if [ -z "$API_URL" ]; then
+            API_URL="http://${{ steps.wait-boot.outputs.ip }}:17493"
+          fi
+
+          curl -s -o /dev/null -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\": \"message\",
+              \"attachments\": [{
+                \"contentType\": \"application/vnd.microsoft.card.adaptive\",
+                \"content\": {
+                  \"type\": \"AdaptiveCard\",
+                  \"\$schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",
+                  \"version\": \"1.4\",
+                  \"body\": [
+                    {
+                      \"type\": \"TextBlock\",
+                      \"size\": \"Large\",
+                      \"weight\": \"Bolder\",
+                      \"color\": \"Good\",
+                      \"text\": \"✅ Voicebox Deploy SUCCESS — ${{ matrix.branch }}\"
+                    },
+                    {
+                      \"type\": \"FactSet\",
+                      \"facts\": [
+                        { \"title\": \"Branch:\", \"value\": \"${{ matrix.branch }}\" },
+                        { \"title\": \"Developer:\", \"value\": \"${{ matrix.user }}\" },
+                        { \"title\": \"Instance IP:\", \"value\": \"${{ steps.wait-boot.outputs.ip }}\" },
+                        { \"title\": \"🌐 Web UI:\", \"value\": \"${WEB_URL}\" },
+                        { \"title\": \"⚙️ API:\", \"value\": \"${API_URL}\" },
+                        { \"title\": \"📖 API Docs:\", \"value\": \"${API_URL}/docs\" }
+                      ]
+                    }
+                  ],
+                  \"actions\": [
+                    {
+                      \"type\": \"Action.OpenUrl\",
+                      \"title\": \"Open Voicebox Web UI\",
+                      \"url\": \"${WEB_URL}\"
+                    },
+                    {
+                      \"type\": \"Action.OpenUrl\",
+                      \"title\": \"View Workflow Logs\",
+                      \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+                    }
+                  ]
+                }
+              }]
+            }" \
+            "${{ secrets.TEAMS_WEBHOOK_URL }}"
+
+      # --------------------------------------------------------
+      # Notification: Post to Microsoft Teams — failure
+      # --------------------------------------------------------
+      - name: Notify Teams — failure
+        if: failure() && env.TEAMS_ENABLED == 'true'
+        run: |
+          curl -s -o /dev/null -w "%{http_code}" \
+            -H "Content-Type: application/json" \
+            -d '{
+              "type": "message",
+              "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                  "type": "AdaptiveCard",
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "version": "1.4",
+                  "body": [
+                    {
+                      "type": "TextBlock",
+                      "size": "Large",
+                      "weight": "Bolder",
+                      "color": "Attention",
+                      "text": "❌ Voicebox Deploy FAILED — ${{ matrix.branch }}"
+                    },
+                    {
+                      "type": "FactSet",
+                      "facts": [
+                        { "title": "Branch:", "value": "${{ matrix.branch }}" },
+                        { "title": "Developer:", "value": "${{ matrix.user }}" },
+                        { "title": "UUID:", "value": "${{ steps.launch.outputs.uuid || 'N/A' }}" }
+                      ]
+                    },
+                    {
+                      "type": "TextBlock",
+                      "text": "Instance has been auto-terminated. If termination also failed, check the Massed Compute dashboard immediately!",
+                      "wrap": true,
+                      "color": "Attention"
+                    }
+                  ],
+                  "actions": [{
+                    "type": "Action.OpenUrl",
+                    "title": "View Workflow Logs",
+                    "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }]
+                }
+              }]
+            }' \
+            "${{ secrets.TEAMS_WEBHOOK_URL }}"

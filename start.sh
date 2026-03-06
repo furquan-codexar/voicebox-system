@@ -248,12 +248,12 @@ install_python() {
   case "$PLATFORM" in
     linux|wsl)
       if command -v apt-get &>/dev/null; then
-        sudo apt-get update -qq
+        sudo apt-get update -qq || true
         sudo apt-get install -y software-properties-common 2>/dev/null || true
         if ! command -v python3.12 &>/dev/null && ! command -v python3.11 &>/dev/null; then
           log_info "Adding deadsnakes PPA for Python 3.12..."
           sudo add-apt-repository -y ppa:deadsnakes/ppa 2>/dev/null || true
-          sudo apt-get update -qq
+          sudo apt-get update -qq || true
         fi
         sudo apt-get install -y python3.12 python3.12-venv python3-pip 2>/dev/null || \
         sudo apt-get install -y python3.11 python3.11-venv python3-pip 2>/dev/null || \

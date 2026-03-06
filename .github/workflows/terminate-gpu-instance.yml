@@ -1,0 +1,240 @@
+# ============================================================
+# Terminate GPU Instance(s) - Massed Compute
+# ============================================================
+# Manually terminate running GPU instances.
+# Enter a specific UUID or choose "all" to terminate everything.
+#
+# Required GitHub Secrets:
+#   MASSED_COMPUTE_API_TOKEN  - Your Massed Compute API bearer token
+#
+# Optional GitHub Secrets:
+#   TEAMS_WEBHOOK_URL         - Microsoft Teams webhook for notifications
+# ============================================================
+
+name: Terminate GPU Instance
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Instance UUID to terminate (or "all" to terminate all running instances)'
+        required: true
+        type: string
+      confirm_all:
+        description: 'Type "yes" to confirm terminating ALL instances (required when target is "all")'
+        required: false
+        type: string
+
+env:
+  MC_API_BASE: https://vm.massedcompute.com/api/v1
+  TEAMS_ENABLED: ${{ secrets.TEAMS_WEBHOOK_URL != '' }}
+
+jobs:
+  terminate:
+    name: Terminate Instance
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      # --------------------------------------------------------
+      # Step 1: List all running instances
+      # --------------------------------------------------------
+      - name: List running instances
+        id: list
+        run: |
+          echo "Fetching running instances..."
+
+          HTTP_CODE=$(curl -s -o /tmp/instances.json -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+            "${{ env.MC_API_BASE }}/instances")
+
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            echo "WARNING: Failed to list instances (HTTP $HTTP_CODE)"
+            cat /tmp/instances.json
+            echo ""
+            echo "Continuing with termination attempt..."
+            echo "count=0" >> "$GITHUB_OUTPUT"
+          else
+            COUNT=$(cat /tmp/instances.json | jq '.runningInstances | length')
+            echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+            echo ""
+            echo "============================================"
+            echo "  Running Voicebox Instances: $COUNT"
+            echo "============================================"
+
+            if [ "$COUNT" -eq 0 ]; then
+              echo "  No running instances found."
+            else
+              cat /tmp/instances.json | jq -r '.runningInstances[] | "  \(.name)\n    UUID: \(.uuid)\n    IP:   \(.ip)\n    Created: \(.created)\n"'
+            fi
+          fi
+
+      # --------------------------------------------------------
+      # Step 2: Validate and terminate
+      # --------------------------------------------------------
+      - name: Terminate instance(s)
+        id: terminate
+        run: |
+          TARGET="${{ inputs.target }}"
+          CONFIRM="${{ inputs.confirm_all }}"
+
+          if [ "$TARGET" = "all" ]; then
+            # ── Terminate ALL instances ──
+            if [ "$CONFIRM" != "yes" ]; then
+              echo "ERROR: To terminate ALL instances, you must type 'yes' in the confirm field."
+              echo "This is a safety check to prevent accidental mass termination."
+              exit 1
+            fi
+
+            UUIDS=$(cat /tmp/instances.json | jq -r '.runningInstances[].uuid' 2>/dev/null)
+
+            if [ -z "$UUIDS" ]; then
+              echo "No running instances to terminate."
+              echo "terminated=none" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            UUID_ARRAY=$(echo "$UUIDS" | jq -R . | jq -s .)
+            COUNT=$(echo "$UUID_ARRAY" | jq 'length')
+            echo "Terminating ALL $COUNT instances..."
+            echo "UUIDs: $UUID_ARRAY"
+
+            HTTP_CODE=$(curl -s -o /tmp/terminate_response.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"instanceUuids\": $UUID_ARRAY}" \
+              "${{ env.MC_API_BASE }}/instance/terminate")
+
+            echo "terminated=all" >> "$GITHUB_OUTPUT"
+            echo "terminated_count=$COUNT" >> "$GITHUB_OUTPUT"
+
+          else
+            # ── Terminate single instance by UUID ──
+            echo "Terminating instance: $TARGET"
+
+            if ! echo "$TARGET" | grep -qE '^[a-f0-9-]{36}$'; then
+              echo "WARNING: '$TARGET' doesn't look like a valid UUID."
+              echo "Expected format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
+              echo "Attempting termination anyway..."
+            fi
+
+            HTTP_CODE=$(curl -s -o /tmp/terminate_response.json -w "%{http_code}" \
+              -X POST \
+              -H "Authorization: Bearer ${{ secrets.MASSED_COMPUTE_API_TOKEN }}" \
+              -H "Content-Type: application/json" \
+              -d "{\"instanceUuids\": [\"$TARGET\"]}" \
+              "${{ env.MC_API_BASE }}/instance/terminate")
+
+            echo "terminated=single" >> "$GITHUB_OUTPUT"
+            echo "terminated_count=1" >> "$GITHUB_OUTPUT"
+          fi
+
+          # Check result
+          if [ "$HTTP_CODE" -eq 202 ] || [ "$HTTP_CODE" -eq 200 ]; then
+            echo ""
+            echo "============================================"
+            echo "  Instance(s) terminated successfully!"
+            echo "============================================"
+            cat /tmp/terminate_response.json | jq . 2>/dev/null || cat /tmp/terminate_response.json
+          else
+            echo ""
+            echo "ERROR: Terminate returned HTTP $HTTP_CODE:"
+            cat /tmp/terminate_response.json | jq . 2>/dev/null || cat /tmp/terminate_response.json
+            echo ""
+            echo "Check the Massed Compute dashboard!"
+            exit 1
+          fi
+
+      # --------------------------------------------------------
+      # Notification: Post to Microsoft Teams — success
+      # --------------------------------------------------------
+      - name: Notify Teams — terminated
+        if: success() && env.TEAMS_ENABLED == 'true'
+        run: |
+          TARGET="${{ inputs.target }}"
+          if [ "$TARGET" = "all" ]; then
+            TITLE="🛑 All Voicebox GPU Instances Terminated"
+            DETAIL="All running instances have been terminated."
+          else
+            TITLE="🛑 Voicebox GPU Instance Terminated"
+            DETAIL="UUID: $TARGET"
+          fi
+
+          curl -s -o /dev/null \
+            -H "Content-Type: application/json" \
+            -d "{
+              \"type\": \"message\",
+              \"attachments\": [{
+                \"contentType\": \"application/vnd.microsoft.card.adaptive\",
+                \"content\": {
+                  \"type\": \"AdaptiveCard\",
+                  \"\$schema\": \"http://adaptivecards.io/schemas/adaptive-card.json\",
+                  \"version\": \"1.4\",
+                  \"body\": [
+                    {
+                      \"type\": \"TextBlock\",
+                      \"size\": \"Large\",
+                      \"weight\": \"Bolder\",
+                      \"color\": \"Warning\",
+                      \"text\": \"$TITLE\"
+                    },
+                    {
+                      \"type\": \"FactSet\",
+                      \"facts\": [
+                        { \"title\": \"Target:\", \"value\": \"$TARGET\" },
+                        { \"title\": \"By:\", \"value\": \"${{ github.actor }}\" }
+                      ]
+                    }
+                  ],
+                  \"actions\": [{
+                    \"type\": \"Action.OpenUrl\",
+                    \"title\": \"View Logs\",
+                    \"url\": \"${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"
+                  }]
+                }
+              }]
+            }" \
+            "${{ secrets.TEAMS_WEBHOOK_URL }}"
+
+      # --------------------------------------------------------
+      # Notification: Post to Microsoft Teams — failure
+      # --------------------------------------------------------
+      - name: Notify Teams — termination failed
+        if: failure() && env.TEAMS_ENABLED == 'true'
+        run: |
+          curl -s -o /dev/null \
+            -H "Content-Type: application/json" \
+            -d '{
+              "type": "message",
+              "attachments": [{
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                  "type": "AdaptiveCard",
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  "version": "1.4",
+                  "body": [
+                    {
+                      "type": "TextBlock",
+                      "size": "Large",
+                      "weight": "Bolder",
+                      "color": "Attention",
+                      "text": "❌ Voicebox GPU Termination FAILED"
+                    },
+                    {
+                      "type": "TextBlock",
+                      "text": "Could not terminate instance. Check the Massed Compute dashboard immediately!",
+                      "wrap": true,
+                      "color": "Attention"
+                    }
+                  ],
+                  "actions": [{
+                    "type": "Action.OpenUrl",
+                    "title": "View Logs",
+                    "url": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }]
+                }
+              }]
+            }' \
+            "${{ secrets.TEAMS_WEBHOOK_URL }}"
